@@ -8,10 +8,30 @@ export interface Meeting { id: string; slotId: string; startsAt: Date }
 
 export interface FinalizeInput {
   disposition: string
-  durationS: number
   voicemailDropped: boolean
   amdVerdict: string | null
   audio: AudioSnapshot
+}
+
+/**
+ * What the lead row should say once a call against it has resolved.
+ *
+ * `leads.status` was written by nothing and read by the console, so every lead
+ * sat at 'new' forever. One outcome word per lead, derived from the call's own
+ * disposition so the two can never disagree.
+ */
+export function leadStatusFor(disposition: string): string {
+  switch (disposition) {
+    case 'booked':
+      return 'booked'
+    case 'voicemail':
+      return 'voicemail'
+    case 'no_answer':
+    case 'failed':
+      return 'attempted'
+    default:
+      return 'contacted'
+  }
 }
 
 export interface Db {
@@ -21,11 +41,13 @@ export interface Db {
   getLead(leadId: string): Promise<Lead | null>
   getOpenSlots(limit: number): Promise<Slot[]>
   insertTranscriptTurn(callId: string, role: 'agent' | 'prospect', text: string): Promise<void>
-  takeSlot(slotId: string): Promise<boolean>
   getMeetingByCall(callId: string): Promise<Meeting | null>
-  insertMeeting(callId: string, leadId: string, slot: Slot): Promise<Meeting>
+  /** Takes the slot and writes the meeting atomically; null when the slot was already gone. */
+  takeSlotAndInsertMeeting(callId: string, leadId: string, slot: Slot): Promise<Meeting | null>
   upsertQualification(callId: string, fields: Record<string, unknown>): Promise<void>
   finalizeCall(callId: string, input: FinalizeInput): Promise<void>
+  /** Finalizes a call whose media stream never bridged: no audio, no session, no scores. */
+  finalizeUnbridgedCall(callId: string, disposition: string): Promise<void>
   close(): Promise<void>
 }
 
@@ -66,12 +88,6 @@ export function createDb(databaseUrl: string): Db {
         [callId, role, text])
     },
 
-    async takeSlot(slotId) {
-      const rows = await query<{ id: string }>(
-        'update slots set taken = true where id = $1 and taken = false returning id', [slotId])
-      return rows.length === 1
-    },
-
     async getMeetingByCall(callId) {
       const rows = await query<{ id: string; slot_id: string; starts_at: Date }>(
         'select id, slot_id, starts_at from meetings where call_id = $1', [callId])
@@ -79,11 +95,32 @@ export function createDb(databaseUrl: string): Db {
       return r ? { id: r.id, slotId: r.slot_id, startsAt: r.starts_at } : null
     },
 
-    async insertMeeting(callId, leadId, slot) {
-      const rows = await query<{ id: string }>(
-        `insert into meetings (call_id, lead_id, slot_id, starts_at)
-         values ($1, $2, $3, $4) returning id`, [callId, leadId, slot.id, slot.startsAt])
-      return { id: rows[0]!.id, slotId: slot.id, startsAt: slot.startsAt }
+    /**
+     * One transaction, because these two writes are one fact. Taking the slot
+     * without recording the meeting leaves a slot that is permanently
+     * unbookable and a prospect who was told nothing.
+     */
+    async takeSlotAndInsertMeeting(callId, leadId, slot) {
+      const client = await pool.connect()
+      try {
+        await client.query('begin')
+        const taken = await client.query(
+          'update slots set taken = true where id = $1 and taken = false returning id', [slot.id])
+        if (taken.rowCount !== 1) {
+          await client.query('rollback')
+          return null
+        }
+        const rows = await client.query<{ id: string }>(
+          `insert into meetings (call_id, lead_id, slot_id, starts_at)
+           values ($1, $2, $3, $4) returning id`, [callId, leadId, slot.id, slot.startsAt])
+        await client.query('commit')
+        return { id: rows.rows[0]!.id, slotId: slot.id, startsAt: slot.startsAt }
+      } catch (err) {
+        await client.query('rollback')
+        throw err
+      } finally {
+        client.release()
+      }
     },
 
     async upsertQualification(callId, fields) {
@@ -104,10 +141,20 @@ export function createDb(databaseUrl: string): Db {
       const client = await pool.connect()
       try {
         await client.query('begin')
+        // duration_s is computed from the row's own started_at rather than from
+        // the media stream's start, so it matches the clock the console has been
+        // ticking since the row was inserted. Measuring from the Twilio `start`
+        // event excluded ring time and made the console visibly rewind at hangup.
         await client.query(
-          `update calls set ended_at = now(), duration_s = $2, disposition = $3,
-             voicemail_dropped = $4, amd_verdict = $5 where id = $1`,
-          [callId, input.durationS, input.disposition, input.voicemailDropped, input.amdVerdict])
+          `update calls set ended_at = now(),
+             duration_s = extract(epoch from (now() - started_at))::int,
+             disposition = $2, voicemail_dropped = $3, amd_verdict = $4
+           where id = $1`,
+          [callId, input.disposition, input.voicemailDropped, input.amdVerdict])
+        await client.query(
+          `update leads set status = $2
+            where id = (select lead_id from calls where id = $1)`,
+          [callId, leadStatusFor(input.disposition)])
         await client.query(
           `insert into call_scores (call_id, agent_ms, prospect_ms, talk_ratio, agent_interruptions)
            values ($1, $2, $3, $4, $5)
@@ -116,6 +163,45 @@ export function createDb(databaseUrl: string): Db {
              talk_ratio = excluded.talk_ratio, agent_interruptions = excluded.agent_interruptions`,
           [callId, input.audio.agentMs, input.audio.prospectMs, input.audio.talkRatio,
            input.audio.agentInterruptions])
+        await client.query('commit')
+      } catch (err) {
+        await client.query('rollback')
+        throw err
+      } finally {
+        client.release()
+      }
+    },
+
+    /**
+     * A call that rang out, was declined, or was rejected never opened a media
+     * stream, so there is no session to snapshot — but the row still has to be
+     * closed. Left NULL, `activeCall()` in the console returns it forever and
+     * the Call button never re-enables.
+     *
+     * Guarded on `ended_at is null` so it can never clobber a real outcome: the
+     * status callback and the media-socket teardown are both triggered by the
+     * call ending and their order is not guaranteed.
+     */
+    async finalizeUnbridgedCall(callId, disposition) {
+      const client = await pool.connect()
+      try {
+        await client.query('begin')
+        const updated = await client.query(
+          `update calls set ended_at = now(),
+             duration_s = extract(epoch from (now() - started_at))::int,
+             disposition = $2
+           where id = $1 and ended_at is null
+           returning lead_id`,
+          [callId, disposition])
+        if (updated.rowCount === 1) {
+          await client.query(
+            'update leads set status = $2 where id = $1',
+            [updated.rows[0]!.lead_id, leadStatusFor(disposition)])
+          await client.query(
+            `insert into call_scores (call_id, agent_ms, prospect_ms, talk_ratio, agent_interruptions)
+             values ($1, 0, 0, 0, 0) on conflict (call_id) do nothing`,
+            [callId])
+        }
         await client.query('commit')
       } catch (err) {
         await client.query('rollback')

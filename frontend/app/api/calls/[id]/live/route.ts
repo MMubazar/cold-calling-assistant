@@ -71,14 +71,20 @@ function snapshot(row: CallRow, counters: LiveCounters | null): CallSnapshot {
  * console can tail the table over plain SSE instead of opening a second
  * WebSocket. Turns are sent incrementally by id; the call row is re-read each
  * tick because scores only land at teardown.
+ *
+ * `?after=<turnId>` starts the stream past turns the caller already has. A
+ * re-attaching page has server-rendered the transcript so far; without this the
+ * first frame returns every one of them again and the whole transcript renders
+ * twice, with duplicate React keys.
  */
-export async function GET(_request: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
+  const after = new URL(request.url).searchParams.get('after')
   const encoder = new TextEncoder()
 
   const stream = new ReadableStream({
     async start(controller) {
-      let lastTurnId = '0'
+      let lastTurnId = after && /^\d+$/.test(after) ? after : '0'
       let closed = false
       const startedAt = Date.now()
 

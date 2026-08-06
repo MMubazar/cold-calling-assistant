@@ -99,6 +99,27 @@ export function shareVerdict(agentMs: number, prospectMs: number): string {
   return 'agent slightly over target'
 }
 
+/**
+ * Appends turns the list does not already hold, keeping arrival order.
+ *
+ * The live stream is incremental by id, but the ids are the only durable
+ * identity a turn has — so dedup on them here rather than trusting every caller
+ * to pass the right cursor. A re-attaching page seeds the transcript server-side
+ * and then opens the stream; without this the overlap renders every turn twice
+ * with duplicated React keys.
+ */
+export function mergeTurns<T extends { id: string }>(existing: T[], incoming: T[]): T[] {
+  if (incoming.length === 0) return existing
+  const seen = new Set(existing.map((t) => t.id))
+  const fresh: T[] = []
+  for (const turn of incoming) {
+    if (seen.has(turn.id)) continue
+    seen.add(turn.id)
+    fresh.push(turn)
+  }
+  return fresh.length === 0 ? existing : [...existing, ...fresh]
+}
+
 export function formatClock(seconds: number): string {
   const safe = Math.max(0, Math.floor(seconds))
   const m = Math.floor(safe / 60)

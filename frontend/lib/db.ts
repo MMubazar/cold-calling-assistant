@@ -104,10 +104,24 @@ export async function getCall(callId: string): Promise<CallRow | null> {
   return rows[0] ?? null
 }
 
-/** The live call, if one is running: a row with no end time yet. */
+/**
+ * How long a call row may stay open before this console stops believing it.
+ *
+ * The backend caps every call at 300 s (Twilio `timeLimit`), so nothing real
+ * lives longer than that plus ring time. Defence in depth: a row that escapes
+ * finalization would otherwise be returned as "the live call" on every load
+ * forever, `phaseOf` would read it as 'ringing', and the Call button would stay
+ * disabled until someone hand-edited Postgres.
+ */
+const STALE_CALL_MINUTES = 10
+
+/** The live call, if one is running: a recent row with no end time yet. */
 export async function activeCall(): Promise<CallRow | null> {
   const rows = await query<CallRow>(
-    `${CALL_SELECT} where c.ended_at is null order by c.started_at desc limit 1`,
+    `${CALL_SELECT} where c.ended_at is null
+       and c.started_at > now() - ($1 || ' minutes')::interval
+     order by c.started_at desc limit 1`,
+    [String(STALE_CALL_MINUTES)],
   )
   return rows[0] ?? null
 }

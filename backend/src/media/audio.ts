@@ -32,6 +32,17 @@ export class AudioAccounting {
     this.agentFrames += count
   }
 
+  /**
+   * Remove frames that were sent but discarded before playback (barge-in).
+   *
+   * The model streams faster than the line plays, so a `clear` to Twilio throws
+   * away audio the prospect never heard. Counting it as agent speech inflates
+   * the talk ratio — the one number this system exists to produce.
+   */
+  discardOutboundFrames(count: number): void {
+    this.agentFrames = Math.max(0, this.agentFrames - count)
+  }
+
   noteProspectSpeechStart(): void {
     this.prospectSpeaking = true
   }

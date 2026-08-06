@@ -90,6 +90,29 @@ export function normalizeRealtimeEvent(raw: string): RealtimeEvent | null {
   }
 }
 
+/** Just enough of a WebSocket to send on, so the drop path is testable. */
+export interface Sendable {
+  readyState: number
+  send(data: string): void
+}
+
+/**
+ * Sends one event, or warns that it was dropped.
+ *
+ * A silent drop here strands whatever was being sent. The worst case is a tool
+ * result: the model holds the floor waiting for a function output that never
+ * arrives, and the prospect hears dead air. Returns whether it went out.
+ */
+export function sendJson(socket: Sendable, obj: object): boolean {
+  if (socket.readyState !== WebSocket.OPEN) {
+    const type = (obj as { type?: unknown }).type
+    console.warn(`[realtime] dropped ${typeof type === 'string' ? type : 'message'}: socket is not open`)
+    return false
+  }
+  socket.send(JSON.stringify(obj))
+  return true
+}
+
 export interface ConnectOptions {
   apiKey: string
   model: string
@@ -104,9 +127,7 @@ export async function connectRealtime(opts: ConnectOptions): Promise<RealtimeCli
 
   const handlers: ((e: RealtimeEvent) => void)[] = []
   const emit = (e: RealtimeEvent) => handlers.forEach((h) => h(e))
-  const send = (obj: object) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj))
-  }
+  const send = (obj: object) => { sendJson(ws, obj) }
 
   await new Promise<void>((resolve, reject) => {
     ws.once('open', () => resolve())

@@ -10,8 +10,7 @@ const SLOTS: Slot[] = [{ id: 's1', startsAt: new Date('2026-08-10T09:00:00Z') }]
 function fakeDb(overrides: Partial<Db> = {}): Db {
   return {
     getMeetingByCall: async () => null,
-    takeSlot: async () => true,
-    insertMeeting: async (_c: string, _l: string, slot: Slot) =>
+    takeSlotAndInsertMeeting: async (_c: string, _l: string, slot: Slot) =>
       ({ id: 'm1', slotId: slot.id, startsAt: slot.startsAt }),
     upsertQualification: async () => {},
     ...overrides,
@@ -44,7 +43,7 @@ it('is idempotent: a second booking returns the existing meeting', async () => {
   let inserts = 0
   const db = fakeDb({
     getMeetingByCall: async () => ({ id: 'm1', slotId: 's1', startsAt: SLOTS[0]!.startsAt }),
-    insertMeeting: async () => { inserts++; throw new Error('should not be reached') },
+    takeSlotAndInsertMeeting: async () => { inserts++; throw new Error('should not be reached') },
   })
   const res = await handleToolCall('book_meeting', { slot_id: 's1' }, ctx(db))
   expect(res.output).toMatchObject({ booked: true, already_booked: true })
@@ -52,13 +51,29 @@ it('is idempotent: a second booking returns the existing meeting', async () => {
 })
 
 it('reports failure rather than a false booking when the slot was taken concurrently', async () => {
-  const res = await handleToolCall('book_meeting', { slot_id: 's1' }, ctx(fakeDb({ takeSlot: async () => false })))
+  const db = fakeDb({ takeSlotAndInsertMeeting: async () => null })
+  const res = await handleToolCall('book_meeting', { slot_id: 's1' }, ctx(db))
   expect(res.output).toMatchObject({ booked: false })
 })
 
 it('tells the agent to offer email follow-up when booking fails', async () => {
-  const res = await handleToolCall('book_meeting', { slot_id: 's1' }, ctx(fakeDb({ takeSlot: async () => false })))
+  const db = fakeDb({ takeSlotAndInsertMeeting: async () => null })
+  const res = await handleToolCall('book_meeting', { slot_id: 's1' }, ctx(db))
   expect(String((res.output as any).instruction)).toMatch(/email/i)
+})
+
+// One db call, not two. Taking the slot and writing the meeting are one fact:
+// a half-done booking leaves a slot nothing can ever book again.
+it('takes the slot and writes the meeting in a single atomic call', async () => {
+  const calls: string[] = []
+  const db = fakeDb({
+    takeSlotAndInsertMeeting: async (_c: string, _l: string, slot: Slot) => {
+      calls.push('atomic')
+      return { id: 'm1', slotId: slot.id, startsAt: slot.startsAt }
+    },
+  })
+  await handleToolCall('book_meeting', { slot_id: 's1' }, ctx(db))
+  expect(calls).toEqual(['atomic'])
 })
 
 it('saves qualification fields', async () => {

@@ -1,7 +1,7 @@
 import { parseTwilioMessage, mediaMessage, clearMessage, markMessage } from '../media/twilio-frames.js'
 import { AudioAccounting, type AudioSnapshot, ULAW_FRAME_BYTES } from '../media/audio.js'
 import { frameEnergy, SPEECH_ENERGY_THRESHOLD, SPEECH_FRAMES_TO_ABORT } from '../media/ulaw.js'
-import { handleToolCall } from '../agent/tool-handlers.js'
+import { handleToolCall, TOOL_FAILED_OUTPUT, type ToolResult } from '../agent/tool-handlers.js'
 import type { RealtimeClient, RealtimeEvent } from '../agent/realtime.js'
 import type { Db, Slot } from '../lib/db.js'
 
@@ -51,6 +51,13 @@ export class CallSession {
   private mode: 'conversation' | 'voicemail' = 'conversation'
   /** Consecutive above-threshold inbound frames while playing a voicemail. */
   private loudFrames = 0
+  /**
+   * Frames sent to Twilio for the response currently in flight. The model
+   * streams faster than the line plays, so a `clear` discards some of these
+   * before the prospect hears them; this is how many to take back off the
+   * agent's talk time. Reset when a response completes.
+   */
+  private framesThisResponse = 0
 
   constructor(opts: CallSessionOptions) {
     this.opts = opts
@@ -70,7 +77,6 @@ export class CallSession {
         return
       case 'media':
         if (!this.started) return
-        this.audio.noteInboundFrame()
         if (this.mode === 'voicemail') {
           // Twilio streams inbound audio continuously whether or not anyone is
           // speaking, and the model session (our usual VAD) is closed during a
@@ -84,6 +90,11 @@ export class CallSession {
           }
           return
         }
+        // Counted below the voicemail branch, not above it: during a drop the
+        // model session (and with it the VAD that flips prospect speech off) is
+        // closed, so a frame arriving then is a machine's greeting, never
+        // measurable prospect speech.
+        this.audio.noteInboundFrame()
         this.opts.realtime.sendAudio(msg.payload)
         return
       case 'mark':
@@ -116,6 +127,9 @@ export class CallSession {
           // Cancelling the model does not depend on having a stream; sending to
           // Twilio does.
           if (this.streamSid !== null) this.sendToTwilio(clearMessage(this.streamSid))
+          // The cleared frames were counted at send time but never played, so
+          // take them back off the agent's talk time in the same breath.
+          this.discardQueuedAgentAudio()
           this.opts.realtime.cancelResponse()
           this.agentSpeaking = false
         }
@@ -127,6 +141,9 @@ export class CallSession {
 
       case 'response_done':
         this.agentSpeaking = false
+        // Everything for this response has been handed over; nothing left to
+        // take back if a later response is interrupted.
+        this.framesThisResponse = 0
         return
 
       case 'transcript':
@@ -140,11 +157,13 @@ export class CallSession {
         return
 
       case 'error':
-        console.error('[session] realtime error', e.message)
-        // Do NOT set this.disposition here. end()'s guard exists to stop a
-        // default close from clobbering a real outcome; pre-setting the field
-        // defeats it, and a call that booked a meeting would persist as failed.
-        this.end('failed')
+        // Log and carry on. The Realtime API emits `error` for recoverable
+        // conditions — a transient server_error, an invalid_request_error on one
+        // event, a response.cancel with nothing to cancel — so hanging up here
+        // terminated healthy calls on a live prospect. `closed` is the only
+        // terminal signal, and DEFAULT_DISPOSITION already makes a genuine
+        // session drop persist as 'failed' without any special handling.
+        console.error('[session] realtime error (continuing)', e.message)
         return
 
       case 'closed':
@@ -166,8 +185,22 @@ export class CallSession {
       this.agentSpeaking = true
       this.audio.noteAgentAudioStart()
     }
-    this.audio.noteOutboundFrames(Math.ceil(bytes / ULAW_FRAME_BYTES))
+    const frames = Math.ceil(bytes / ULAW_FRAME_BYTES)
+    this.audio.noteOutboundFrames(frames)
+    this.framesThisResponse += frames
     this.sendToTwilio(mediaMessage(this.streamSid, payloadB64))
+  }
+
+  /**
+   * Un-count the frames sent for the response in flight.
+   *
+   * Called wherever a `clear` is sent to Twilio: `clear` drops the queued
+   * playback buffer, so those frames were credited to the agent at send time and
+   * never reached the prospect's ear.
+   */
+  private discardQueuedAgentAudio(): void {
+    this.audio.discardOutboundFrames(this.framesThisResponse)
+    this.framesThisResponse = 0
   }
 
   /**
@@ -183,9 +216,16 @@ export class CallSession {
     this.mode = 'voicemail'
     this.loudFrames = 0
     this.opts.realtime.close()
+    // Closing the model session takes the VAD with it, so no speech_stopped can
+    // ever arrive. Left latched, every remaining 20 ms frame of the call would be
+    // credited to the prospect at 50 frames a second and the talk ratio would
+    // collapse to zero — worst on an AMD false positive, where the human really
+    // was mid-greeting.
+    this.audio.noteProspectSpeechStop()
 
     if (this.agentSpeaking) {
       if (this.streamSid !== null) this.sendToTwilio(clearMessage(this.streamSid))
+      this.discardQueuedAgentAudio()
       this.agentSpeaking = false
     }
 
@@ -231,12 +271,22 @@ export class CallSession {
   }
 
   private async runTool(toolCallId: string, name: string, args: Record<string, unknown>): Promise<void> {
-    const res = await handleToolCall(name, args, {
-      callId: this.opts.callId,
-      leadId: this.opts.leadId,
-      slots: this.opts.slots,
-      db: this.opts.db,
-    })
+    let res: ToolResult
+    try {
+      res = await handleToolCall(name, args, {
+        callId: this.opts.callId,
+        leadId: this.opts.leadId,
+        slots: this.opts.slots,
+        db: this.opts.db,
+      })
+    } catch (err) {
+      // The model is holding the floor waiting for this result, mid-sentence,
+      // right after the prospect said yes. track() logs and swallows, so without
+      // this the tool call is never answered and the prospect gets dead air.
+      console.error(`[session] tool ${name} threw; answering the model anyway`, err)
+      this.opts.realtime.sendToolResult(toolCallId, TOOL_FAILED_OUTPUT)
+      return
+    }
 
     if (name === 'book_meeting' && (res.output as any)?.booked === true) {
       this.disposition = 'booked'
@@ -267,7 +317,6 @@ export class CallSession {
     if (disposition !== DEFAULT_DISPOSITION || this.disposition === DEFAULT_DISPOSITION) {
       this.disposition = disposition
     }
-    this.opts.realtime.close()
     this.opts.transport.close()
     this.finish()
   }
@@ -275,6 +324,12 @@ export class CallSession {
   private finish(): void {
     if (this.finished) return
     this.finished = true
+    // Every ending routes through here — including the commonest one, the
+    // prospect hanging up, which arrives as a Twilio `stop` or a socket close and
+    // never touched end(). Without this the model WebSocket stayed open for the
+    // life of the process, holding the session reachable and still counting
+    // post-hangup audio deltas as agent speech. close() is idempotent.
+    this.opts.realtime.close()
     this.finishedHandlers.forEach((h) => h())
   }
 

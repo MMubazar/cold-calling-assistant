@@ -34,14 +34,14 @@ function fakeRealtime() {
 // Parameters are annotated because the `as unknown as Db` cast happens after the
 // literal is built, so nothing contextually types these callbacks. Without the
 // annotations `noImplicitAny` fails the typecheck.
-function fakeDb(): Db {
+function fakeDb(overrides: Partial<Db> = {}): Db {
   return {
     insertTranscriptTurn: async () => {},
     getMeetingByCall: async () => null,
-    takeSlot: async () => true,
-    insertMeeting: async (_c: string, _l: string, s: Slot) =>
+    takeSlotAndInsertMeeting: async (_c: string, _l: string, s: Slot) =>
       ({ id: 'm1', slotId: s.id, startsAt: s.startsAt }),
     upsertQualification: async () => {},
+    ...overrides,
   } as unknown as Db
 }
 
@@ -56,13 +56,13 @@ function startMessage(callId = 'call-1') {
 const mediaMsg = (payload: string) =>
   JSON.stringify({ event: 'media', streamSid: 'MZ1', media: { track: 'inbound', payload } })
 
-function build() {
+function build(db: Db = fakeDb()) {
   const t = fakeTransport()
   const r = fakeRealtime()
   const session = new CallSession({
     transport: t.transport,
     realtime: r.client,
-    db: fakeDb(),
+    db,
     callId: 'call-1',
     leadId: 'lead-1',
     slots: SLOTS,
@@ -190,11 +190,50 @@ it('ignores empty transcripts', async () => {
   expect(stored).toHaveLength(0)
 })
 
-it('marks disposition failed when the model session errors out', () => {
+// The Realtime API emits `error` for recoverable conditions too — a transient
+// server_error, an invalid_request_error on one event, a response.cancel with
+// nothing to cancel. Ending the call on any of those hung up on a live prospect.
+it('keeps talking after a realtime error rather than hanging up', () => {
+  const { t, r } = build()
+  t.inject(startMessage())
+  r.emit({ kind: 'error', message: 'transient server_error' })
+  r.emit({ kind: 'audio', payload: 'BBBB' })
+  expect(t.sent.map((s) => JSON.parse(s).event)).toContain('media')
+})
+
+it('leaves the transport open after a realtime error', () => {
+  const { session, t, r } = build()
+  let finished = 0
+  session.onFinished(() => { finished++ })
+  t.inject(startMessage())
+  r.emit({ kind: 'error', message: 'invalid_request_error' })
+  expect(finished).toBe(0)
+})
+
+// `closed` is the terminal signal, and DEFAULT_DISPOSITION already makes a
+// genuine session drop persist as failed without special handling.
+it('marks disposition failed when the model session closes with nothing achieved', () => {
   const { session, t, r } = build()
   t.inject(startMessage())
-  r.emit({ kind: 'error', message: 'session died' })
+  r.emit({ kind: 'closed' })
   expect(session.result().disposition).toBe('failed')
+})
+
+// The commonest ending of all is the prospect hanging up, which arrives as a
+// Twilio stop or a socket close and never went through end(). The model socket
+// used to stay open for the life of the process.
+it('closes the model socket when the far end hangs up', () => {
+  const { t, r } = build()
+  t.inject(startMessage())
+  t.inject(JSON.stringify({ event: 'stop' }))
+  expect(r.calls).toContain('close')
+})
+
+it('closes the model socket when the Twilio socket closes', () => {
+  const { t, r } = build()
+  t.inject(startMessage())
+  t.fireClose()
+  expect(r.calls).toContain('close')
 })
 
 it('finishes on the Twilio stop event and notifies listeners exactly once', () => {
@@ -225,13 +264,54 @@ it('keeps disposition booked when end_call follows a successful booking', async 
   expect(session.result().disposition).toBe('booked')
 })
 
-it('keeps disposition booked when the model session errors after a booking', async () => {
+it('keeps disposition booked when the model session closes after a booking', async () => {
   const { session, t, r } = build()
   t.inject(startMessage())
   r.emit({ kind: 'tool_call', toolCallId: 'fc1', name: 'book_meeting', args: { slot_id: 's1' } })
   await session.settled()
-  r.emit({ kind: 'error', message: 'socket died' })
+  r.emit({ kind: 'closed' })
   expect(session.result().disposition).toBe('booked')
+})
+
+// The production failure this guards: the prospect agrees, the model emits
+// book_meeting, the write is in flight, and the socket closes. Teardown must
+// drain settled() before snapshotting or the call persists as failed with a real
+// meetings row and a taken slot against it.
+it('reports booked when the socket closes with the booking still in flight', async () => {
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const { session, t, r } = build(fakeDb({
+    takeSlotAndInsertMeeting: async (_c: string, _l: string, s: Slot) => {
+      await gate
+      return { id: 'm1', slotId: s.id, startsAt: s.startsAt }
+    },
+  }))
+  t.inject(startMessage())
+  r.emit({ kind: 'tool_call', toolCallId: 'fc1', name: 'book_meeting', args: { slot_id: 's1' } })
+
+  // The socket dies mid-write, exactly as it does in production.
+  r.emit({ kind: 'closed' })
+  expect(session.result().disposition).toBe('failed') // not yet drained
+
+  release()
+  await session.settled()
+  expect(session.result().disposition).toBe('booked')
+})
+
+// track() logs and swallows, so without a catch in runTool the model never
+// receives a function output and holds the floor forever, mid-sentence.
+it('always answers a tool call, even when the tool throws', async () => {
+  const { session, t, r } = build(fakeDb({
+    takeSlotAndInsertMeeting: async () => { throw new Error('db gone') },
+  }))
+  t.inject(startMessage())
+  r.emit({ kind: 'tool_call', toolCallId: 'fc1', name: 'book_meeting', args: { slot_id: 's1' } })
+  await session.settled()
+  const answer = r.calls.find((c) => c.startsWith('toolresult:fc1'))
+  expect(answer).toBeDefined()
+  expect(answer).toMatch(/"booked":false/)
+  expect(answer).toMatch(/email/i)
+  expect(session.result().disposition).not.toBe('booked')
 })
 
 it('sends nothing to Twilio when model audio arrives before the start event', () => {
@@ -245,5 +325,50 @@ it('does not count an empty audio delta as 20 ms of speech', () => {
   const { session, t, r } = build()
   t.inject(startMessage())
   r.emit({ kind: 'audio', payload: '' })
+  expect(session.result().audio.agentMs).toBe(0)
+})
+
+// A `clear` throws away Twilio's queued playback buffer. Those frames were
+// credited to the agent at send time but the prospect never heard them, so an
+// agent that yields politely three times could be reported as "pitching".
+const agentFrames = (n: number) => Buffer.alloc(160 * n).fill(0x7f).toString('base64')
+
+it('counts every frame it sends while the agent holds the floor', () => {
+  const { session, t, r } = build()
+  t.inject(startMessage())
+  r.emit({ kind: 'audio', payload: agentFrames(50) })
+  expect(session.result().audio.agentMs).toBe(1000)
+})
+
+it('takes back the frames discarded by a barge-in clear', () => {
+  const { session, t, r } = build()
+  t.inject(startMessage())
+
+  // A first response that plays out in full and is counted.
+  r.emit({ kind: 'audio', payload: agentFrames(25) })   // 500 ms
+  r.emit({ kind: 'response_done' })
+
+  // A second response, interrupted after 40 frames were queued.
+  r.emit({ kind: 'audio', payload: agentFrames(40) })   // 800 ms, queued
+  r.emit({ kind: 'prospect_speech_started' })
+
+  expect(t.sent.map((s) => JSON.parse(s).event)).toContain('clear')
+  expect(session.result().audio.agentMs).toBe(500)      // only what survived
+})
+
+it('does not count voicemail-clear discards twice, and never goes negative', () => {
+  const { session, t, r } = build()
+  t.inject(startMessage())
+  r.emit({ kind: 'audio', payload: agentFrames(10) })
+  r.emit({ kind: 'prospect_speech_started' })           // discards all ten
+  r.emit({ kind: 'prospect_speech_started' })           // nothing left to discard
+  expect(session.result().audio.agentMs).toBe(0)
+})
+
+it('removes the pre-voicemail clear from the agent talk time too', () => {
+  const { session, t, r } = build()
+  t.inject(startMessage())
+  r.emit({ kind: 'audio', payload: agentFrames(30) })   // 600 ms queued
+  session.applyAmdVerdict('machine_start')              // clears before the drop
   expect(session.result().audio.agentMs).toBe(0)
 })

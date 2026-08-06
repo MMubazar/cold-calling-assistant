@@ -123,6 +123,27 @@ Recording stays **off** for these calls (Twilio call recording is not enabled an
 codebase). If a later phase turns it on, the agent's opener must disclose it — do not enable
 recording silently.
 
+### Webhook signatures
+
+`ngrok` puts this server on the public internet, and `/amd` and `/status` are both destructive:
+a forged `AnsweredBy=machine_start` would drop a voicemail over a live human conversation, and a
+forged `/status` would claim the teardown so the real one silently discards the call's disposition
+and scores. Both routes therefore validate Twilio's `x-twilio-signature` against
+`TWILIO_AUTH_TOKEN` and return **403** on any mismatch.
+
+Consequences for you:
+
+- A hand-crafted `curl -X POST .../amd?callId=...` returns `403`. That is correct, not a bug.
+  There is no way to fake a verdict by hand; use a real call.
+- The signature covers the exact URL Twilio was told to call, which the server rebuilds from
+  `PUBLIC_BASE_URL`. If `PUBLIC_BASE_URL` does not match the ngrok URL Twilio is actually hitting,
+  **every** webhook 403s and calls will never be finalized. The log line is
+  `[status] call=... rejected: bad Twilio signature` — if you see that after an ngrok restart, the
+  stale `PUBLIC_BASE_URL` is the cause.
+
+`POST /calls` is deliberately **not** signature-checked: it is the operator's own route, driven by
+the curl commands below, and its guard is `VERIFIED_NUMBERS`.
+
 ### Operator console (optional but recommended)
 
 A Next.js console lives in `frontend/`. It reads the same Postgres database and shows the lead
@@ -203,6 +224,27 @@ psql -h 127.0.0.1 -p 5470 -U sb -d coldcall -c "select disposition, voicemail_dr
 **Pass criteria:** `disposition` is `voicemail`, `voicemail_dropped` is true, and the recorded
 message plays cleanly with no clipping at either end.
 
+## Test call 3 — nobody answers
+
+Place the call the same way and let it ring out without answering, or decline it. No media
+stream ever opens, so there is no session to snapshot — Twilio's `/status` callback is what closes
+the row out.
+
+```bash
+psql -h 127.0.0.1 -p 5470 -U sb -d coldcall -c "select disposition, duration_s, ended_at
+  from calls order by started_at desc limit 1;"
+```
+
+**Pass criteria:** `disposition` is `no_answer` (or `failed` if Twilio reported `CallStatus=failed`,
+e.g. an unroutable number), `ended_at` is set, and `duration_s` covers the ring time. A row left
+with `ended_at` NULL is a bug, not an in-progress call — the console treats the most recent open
+row as the live call, so an unfinalized one keeps the **Call** button disabled. (The console now
+also ignores open rows older than ten minutes, so a stuck row degrades rather than bricking the
+UI, but the row itself still needs finalizing.)
+
+Every call is capped at **300 seconds** by Twilio's `timeLimit`; a call that reaches the ceiling
+is hung up by Twilio and finalized through the same `/status` path.
+
 ## Expected first-run problem: AMD false positive
 
 Answering your own phone with a flat "hello?" is the pattern machine detection most often
@@ -236,6 +278,7 @@ the model session alive through a false positive is Phase 2 work.
 | Agent talks over you constantly | `SILENCE_DURATION_MS` (in `src/agent/playbook.ts`) too low. Raise it. |
 | Long pauses before the agent replies | Region mismatch, or the full rather than mini model tier. |
 | `403` from `/calls` | Number is not in `VERIFIED_NUMBERS`. Working as designed. |
+| `403` from a hand-crafted `POST /amd` or `POST /status` | Working as designed — see "Webhook signatures" below. |
 | Socket opens then closes at once | Bad or stale `OPENAI_REALTIME_MODEL`. |
 | Console's talk-time band stays blank mid-call | Backend not reachable at `BACKEND_URL`, or `GET /calls/:id/stats` isn't returning a live session — confirm the call is actually connected server-side. |
 | `ffmpeg: command not found` | Not installed on this machine. `sudo apt install -y ffmpeg`, or use `npx tsx scripts/make-voicemail.ts --synth` instead. |

@@ -172,6 +172,30 @@ it('ignores a verdict arriving after the call already finished', () => {
   expect(payloads(h.sent)).toEqual([])
 })
 
+// The latch this replaced: prospect speech was noted before the mode branch and
+// applyAmdVerdict closed the model session (and with it the VAD) without ever
+// stopping it. Every remaining 20 ms frame was then credited to the prospect at
+// 50 a second, so prospect_ms grew to the whole call and talk_ratio collapsed —
+// on exactly the call the spec says is most likely, the operator's own phone.
+it('does not credit voicemail-mode frames to the prospect', () => {
+  const h = harness()
+  h.emit({ kind: 'prospect_speech_started' })   // human mid-greeting
+  h.session.applyAmdVerdict('machine_start')
+  h.silence()
+  expect(h.session.result().audio.prospectMs).toBe(0)
+})
+
+it('does not inflate the prospect counter after an aborted drop', () => {
+  const h = harness()
+  h.emit({ kind: 'prospect_speech_started' })
+  h.session.applyAmdVerdict('machine_start')
+  h.speak()               // trips the abort — a human really is on the line
+  h.silence(100)          // Twilio keeps streaming; none of this is speech
+  h.frame(h.LOUD)
+  expect(h.session.result().audio.prospectMs).toBe(0)
+  expect(h.session.result().audio.talkRatio).toBe(0)
+})
+
 it('falls back to ending the call when no voicemail audio is configured', () => {
   const h = harness([])
   h.session.applyAmdVerdict('machine_start')

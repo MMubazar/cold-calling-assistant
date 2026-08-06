@@ -1,10 +1,13 @@
+import twilio from 'twilio'
 import {
   buildTwiml,
   createCallHandler,
   parseStatsPath,
   readBody,
   socketTransport,
+  twilioSignatureOk,
   BodyTooLarge,
+  MAX_CALL_SECONDS,
   statsPayload,
 } from '../src/server.js'
 import type { CallResult } from '../src/call/session.js'
@@ -83,6 +86,16 @@ it('requests async machine detection so connection is never delayed', async () =
   expect(d.created[0].machineDetection).toBe('DetectMessageEnd')
   expect(String(d.created[0].asyncAmd)).toBe('true')
   expect(d.created[0].asyncAmdStatusCallback).toContain('/amd')
+})
+
+// The spec's 300 s ceiling. It was a Vercel Functions artifact that vanished when
+// the backend became a standalone process, and nothing replaced it; Twilio's own
+// timeLimit is the enforcement point now.
+it('caps every call at the 300 s ceiling', async () => {
+  const d = deps()
+  await d.handler({ leadId: 'l1', to: '+923001234567' })
+  expect(MAX_CALL_SECONDS).toBe(300)
+  expect(d.created[0].timeLimit).toBe(300)
 })
 
 it('never enables call recording', async () => {
@@ -201,4 +214,71 @@ it('does not let a late message overtake ones already buffered', () => {
   f.deliver('second') // arrives after the handler but before flush
   transport.flush()
   expect(seen).toEqual(['first', 'second'])
+})
+
+// /amd and /status are reachable by anyone who finds the ngrok URL, and both are
+// destructive: a forged AnsweredBy=machine_start drops a voicemail over a live
+// human conversation, and a forged /status claims the teardown so the real one
+// silently discards the call's disposition and scores.
+
+const AUTH_TOKEN = 'test-auth-token'
+const BASE = 'https://abc.ngrok.app'
+
+const sign = (pathWithQuery: string, params: Record<string, string>) =>
+  twilio.getExpectedTwilioSignature(AUTH_TOKEN, `${BASE}${pathWithQuery}`, params)
+
+it('accepts a webhook signed with the account auth token', () => {
+  const path = '/amd?callId=call-1'
+  const params = { AnsweredBy: 'machine_start', CallSid: 'CA1' }
+  expect(twilioSignatureOk({
+    authToken: AUTH_TOKEN, publicBaseUrl: BASE, pathWithQuery: path,
+    signature: sign(path, params), params,
+  })).toBe(true)
+})
+
+it('rejects a webhook with no signature header at all', () => {
+  expect(twilioSignatureOk({
+    authToken: AUTH_TOKEN, publicBaseUrl: BASE, pathWithQuery: '/amd?callId=call-1',
+    signature: undefined, params: { AnsweredBy: 'machine_start' },
+  })).toBe(false)
+})
+
+it('rejects a forged signature', () => {
+  expect(twilioSignatureOk({
+    authToken: AUTH_TOKEN, publicBaseUrl: BASE, pathWithQuery: '/amd?callId=call-1',
+    signature: 'not-a-signature', params: { AnsweredBy: 'machine_start' },
+  })).toBe(false)
+})
+
+it('rejects a body whose parameters were tampered with after signing', () => {
+  const path = '/amd?callId=call-1'
+  const signature = sign(path, { AnsweredBy: 'human' })
+  expect(twilioSignatureOk({
+    authToken: AUTH_TOKEN, publicBaseUrl: BASE, pathWithQuery: path,
+    signature, params: { AnsweredBy: 'machine_start' },
+  })).toBe(false)
+})
+
+it('rejects a signature for a different call id in the query string', () => {
+  const params = { AnsweredBy: 'machine_start' }
+  const signature = sign('/amd?callId=someone-elses-call', params)
+  expect(twilioSignatureOk({
+    authToken: AUTH_TOKEN, publicBaseUrl: BASE, pathWithQuery: '/amd?callId=call-1',
+    signature, params,
+  })).toBe(false)
+})
+
+// The signed URL is the one Twilio was configured to call, so it is rebuilt from
+// PUBLIC_BASE_URL. A proxied Host header would never match.
+it('validates against PUBLIC_BASE_URL, not the host the request arrived on', () => {
+  const path = '/status?callId=call-1'
+  const params = { CallStatus: 'no-answer' }
+  const signature = sign(path, params)
+  expect(twilioSignatureOk({
+    authToken: AUTH_TOKEN, publicBaseUrl: 'https://attacker.example', pathWithQuery: path,
+    signature, params,
+  })).toBe(false)
+  expect(twilioSignatureOk({
+    authToken: AUTH_TOKEN, publicBaseUrl: BASE, pathWithQuery: path, signature, params,
+  })).toBe(true)
 })

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { LeadList } from './LeadList'
 import { LivePanel, type Turn } from './LivePanel'
 import type { LeadRow } from '@/lib/db'
-import { type CallSnapshot, LIVE_PHASES, phaseOf } from '@/lib/call-state'
+import { type CallSnapshot, LIVE_PHASES, mergeTurns, phaseOf } from '@/lib/call-state'
 
 interface StreamFrame {
   call: CallSnapshot | null
@@ -30,15 +30,24 @@ export function Console({
 
   const stream = useRef<EventSource | null>(null)
 
-  const follow = useCallback((callId: string) => {
+  /**
+   * `after` is the last turn already on screen. A re-attaching page has already
+   * server-rendered the transcript, so starting the stream at '0' would return
+   * every one of those turns again and render the lot twice.
+   */
+  const follow = useCallback((callId: string, after = '0') => {
     stream.current?.close()
-    const source = new EventSource(`/api/calls/${callId}/live`)
+    const source = new EventSource(
+      `/api/calls/${callId}/live?after=${encodeURIComponent(after)}`,
+    )
     stream.current = source
 
     source.onmessage = (event) => {
       const frame: StreamFrame = JSON.parse(event.data)
       if (frame.call) setCall(frame.call)
-      if (frame.turns.length > 0) setTurns((prev) => [...prev, ...frame.turns])
+      // Deduped by id as well as cursored, so a future caller passing the wrong
+      // cursor cannot put the transcript on screen twice.
+      if (frame.turns.length > 0) setTurns((prev) => mergeTurns(prev, frame.turns))
       if (frame.done) {
         source.close()
         stream.current = null
@@ -54,11 +63,16 @@ export function Console({
     }
   }, [])
 
+  // The last turn the server already rendered into the page.
+  const seededThrough = initialTurns.length > 0 ? initialTurns[initialTurns.length - 1]!.id : '0'
+
   // Reattach to a call that was already running when the page loaded.
   useEffect(() => {
-    if (initialCall && LIVE_PHASES.includes(phaseOf(initialCall))) follow(initialCall.id)
+    if (initialCall && LIVE_PHASES.includes(phaseOf(initialCall))) {
+      follow(initialCall.id, seededThrough)
+    }
     return () => stream.current?.close()
-  }, [initialCall, follow])
+  }, [initialCall, seededThrough, follow])
 
   // Duration ticker. Derived from the start time so it survives a lost frame.
   useEffect(() => {

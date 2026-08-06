@@ -8,12 +8,18 @@ import { buildInstructions } from './agent/playbook.js'
 import { connectRealtime } from './agent/realtime.js'
 import { loadVoicemailFrames } from './media/ulaw.js'
 import { CallSession, type CallResult, type Transport } from './call/session.js'
-import { persistCallResult } from './call/teardown.js'
+import {
+  persistCallResult,
+  persistUnbridgedCall,
+  dispositionForCallStatus,
+} from './call/teardown.js'
 import { parseTwilioMessage } from './media/twilio-frames.js'
 
 const AGENT_NAME = 'Sara'
 const COMPANY_NAME = 'Northwind'
 const MAX_SLOTS = 12
+/** Spec §5's call-duration ceiling, enforced by Twilio's own timeLimit. */
+export const MAX_CALL_SECONDS = 300
 
 const escapeXml = (s: string) =>
   s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
@@ -91,6 +97,10 @@ export function createCallHandler(deps: CallHandlerDeps) {
         asyncAmd: 'true',
         asyncAmdStatusCallback: `${base}/amd?callId=${call.id}`,
         asyncAmdStatusCallbackMethod: 'POST',
+        // Hard ceiling from the design spec. Twilio hangs up at 300 s, which is
+        // the only duration limit this system has now that the backend is a
+        // long-running process rather than a serverless function.
+        timeLimit: MAX_CALL_SECONDS,
       })
       await deps.db.attachTwilioSid(call.id, created.sid)
       return { status: 201, body: { callId: call.id, twilioSid: created.sid } }
@@ -103,8 +113,7 @@ export function createCallHandler(deps: CallHandlerDeps) {
 
 // ---------------------------------------------------------------- live sessions
 
-interface Live { session: CallSession; startedAtMs: number }
-const live = new Map<string, Live>()
+const live = new Map<string, CallSession>()
 
 /** AMD verdicts that arrived before their session finished connecting. */
 const earlyVerdicts = new Map<string, string>()
@@ -182,6 +191,38 @@ function parseForm(body: string): Record<string, string> {
   return Object.fromEntries(new URLSearchParams(body))
 }
 
+export interface SignatureCheck {
+  authToken: string
+  /** PUBLIC_BASE_URL — the host Twilio actually signed, not whatever Host header arrived. */
+  publicBaseUrl: string
+  /** e.g. `/amd?callId=abc`. Signed exactly as Twilio was configured to call it. */
+  pathWithQuery: string
+  signature: string | undefined
+  params: Record<string, string>
+}
+
+/**
+ * Whether a Twilio webhook really came from Twilio.
+ *
+ * `/amd` and `/status` are reachable by anyone who finds the ngrok URL, and both
+ * are destructive: a forged `AnsweredBy=machine_start` drops a voicemail over a
+ * live human conversation, and a forged `/status` claims the teardown so the real
+ * one silently discards the call's disposition and scores.
+ *
+ * The URL is rebuilt from PUBLIC_BASE_URL rather than taken from the request,
+ * because the signature covers the URL Twilio was told to call — a proxied Host
+ * header would never match.
+ */
+export function twilioSignatureOk(check: SignatureCheck): boolean {
+  if (typeof check.signature !== 'string' || check.signature.length === 0) return false
+  return twilio.validateRequest(
+    check.authToken,
+    check.signature,
+    `${check.publicBaseUrl}${check.pathWithQuery}`,
+    check.params,
+  )
+}
+
 export async function startServer(env: Env): Promise<void> {
   const db = createDb(env.databaseUrl)
   const client = twilio(env.twilioAccountSid, env.twilioAuthToken)
@@ -199,6 +240,19 @@ export async function startServer(env: Env): Promise<void> {
     res.end(JSON.stringify(body))
   }
 
+  /**
+   * `/calls` is deliberately not checked: it is the operator's own curl-driven
+   * route and is guarded by VERIFIED_NUMBERS. Twilio's webhooks are.
+   */
+  const signed = (req: IncomingMessage, url: URL, params: Record<string, string>) =>
+    twilioSignatureOk({
+      authToken: env.twilioAuthToken,
+      publicBaseUrl: env.publicBaseUrl,
+      pathWithQuery: `${url.pathname}${url.search}`,
+      signature: req.headers['x-twilio-signature'] as string | undefined,
+      params,
+    })
+
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost')
     const callId = url.searchParams.get('callId') ?? ''
@@ -215,11 +269,16 @@ export async function startServer(env: Env): Promise<void> {
       }
 
       if (req.method === 'POST' && url.pathname === '/amd') {
-        const verdict = parseForm(await readBody(req)).AnsweredBy ?? 'unknown'
+        const params = parseForm(await readBody(req))
+        if (!signed(req, url, params)) {
+          console.warn(`[amd] call=${callId} rejected: bad Twilio signature`)
+          return json(res, 403, { error: 'invalid Twilio signature' })
+        }
+        const verdict = params.AnsweredBy ?? 'unknown'
         console.log(`[amd] call=${callId} verdict=${verdict}`)
-        const entry = live.get(callId)
-        if (entry) {
-          entry.session.applyAmdVerdict(verdict)
+        const session = live.get(callId)
+        if (session) {
+          session.applyAmdVerdict(verdict)
         } else {
           // AMD detection and the media handshake are independent races off the
           // same answer event. A verdict that wins is held for the session to
@@ -232,13 +291,31 @@ export async function startServer(env: Env): Promise<void> {
       }
 
       if (req.method === 'POST' && url.pathname === '/status') {
-        await readBody(req)
+        const params = parseForm(await readBody(req))
+        if (!signed(req, url, params)) {
+          console.warn(`[status] call=${callId} rejected: bad Twilio signature`)
+          return json(res, 403, { error: 'invalid Twilio signature' })
+        }
         // Delete before awaiting: the socket close and this callback are both
         // triggered by the call ending, so whichever arrives second must find
         // nothing left to persist. Map.delete returning true is the claim.
-        const entry = live.get(callId)
-        if (entry && live.delete(callId)) {
-          await persistCallResult(db, callId, entry.session.result(), entry.startedAtMs)
+        const session = live.get(callId)
+        if (session && live.delete(callId)) {
+          // Drain in-flight tool and transcript work before snapshotting.
+          // Without this a booking still being written persists as 'failed'
+          // while its meetings row lands a moment later.
+          await session.settled()
+          await persistCallResult(db, callId, session.result())
+        } else if (!session) {
+          // No live entry means the media stream never bridged: no answer, busy,
+          // or declined. The row must still be closed — left open, the console's
+          // activeCall() returns it forever and the Call button never re-enables.
+          // finalizeUnbridgedCall is guarded on `ended_at is null`, so this can
+          // never overwrite a real outcome that a media teardown already wrote.
+          const status = params.CallStatus ?? ''
+          const disposition = dispositionForCallStatus(status)
+          console.log(`[status] call=${callId} never bridged (CallStatus=${status || 'unknown'}) -> ${disposition}`)
+          await persistUnbridgedCall(db, callId, disposition)
         }
         earlyVerdicts.delete(callId)
         return json(res, 200, { ok: true })
@@ -249,9 +326,9 @@ export async function startServer(env: Env): Promise<void> {
       // teardown, so without this the band sits blank until hangup.
       const statsFor = parseStatsPath(url.pathname)
       if (req.method === 'GET' && statsFor !== null) {
-        const entry = live.get(statsFor)
-        if (!entry) return json(res, 404, { error: 'no live call with that id' })
-        return json(res, 200, statsPayload(entry.session.result()))
+        const session = live.get(statsFor)
+        if (!session) return json(res, 404, { error: 'no live call with that id' })
+        return json(res, 200, statsPayload(session.result()))
       }
 
       return json(res, 404, { error: 'not found' })
@@ -288,7 +365,6 @@ export async function startServer(env: Env): Promise<void> {
       ws.off('message', detectStart)
 
       const callId = msg.customParameters.callId ?? ''
-      const startedAtMs = Date.now()
 
       try {
         const call = await db.query<{ lead_id: string }>(
@@ -308,15 +384,33 @@ export async function startServer(env: Env): Promise<void> {
           }),
         })
 
+        // The Twilio socket can die during setup — three database round trips and
+        // a realtime handshake happen above. CallSession registers its onClose in
+        // the constructor, so on an already-closed socket finish() would never
+        // run: both this live entry and the model socket would leak for the life
+        // of the process. Check before committing to a session. The call row is
+        // still closed out by /status, which now finalizes unbridged calls.
+        if (ws.readyState !== ws.OPEN) {
+          console.warn(`[media] socket closed during setup call=${callId}; discarding session`)
+          realtime.close()
+          earlyVerdicts.delete(callId)
+          return
+        }
+
         const session = new CallSession({
           transport, realtime, db, callId, leadId: lead.id, slots, voicemailFrames,
         })
-        live.set(callId, { session, startedAtMs })
+        live.set(callId, session)
 
         session.onFinished(() => {
           // Claim the entry first; /status may be racing us for the same call.
           if (live.delete(callId)) {
-            void persistCallResult(db, callId, session.result(), startedAtMs)
+            void (async () => {
+              // Drain in-flight tool and transcript work before snapshotting, or
+              // a booking mid-write persists as 'failed' with a real meeting row.
+              await session.settled()
+              await persistCallResult(db, callId, session.result())
+            })()
           }
           earlyVerdicts.delete(callId)
         })

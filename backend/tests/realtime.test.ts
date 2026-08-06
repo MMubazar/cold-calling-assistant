@@ -1,4 +1,4 @@
-import { buildSessionUpdate, normalizeRealtimeEvent } from '../src/agent/realtime.js'
+import { buildSessionUpdate, normalizeRealtimeEvent, sendJson } from '../src/agent/realtime.js'
 import { SILENCE_DURATION_MS } from '../src/agent/playbook.js'
 
 it('configures μ-law in both directions so no resampling is ever needed', () => {
@@ -111,4 +111,30 @@ it('ignores JSON that parses to something other than an object', () => {
 it('ignores an event whose type is not a string', () => {
   expect(normalizeRealtimeEvent(JSON.stringify({ type: 7 }))).toBeNull()
   expect(normalizeRealtimeEvent(JSON.stringify({ type: null }))).toBeNull()
+})
+
+// A message dropped because the socket is not open strands whatever was being
+// sent. The worst case is a tool result: the model holds the floor waiting for a
+// function output that never arrives and the prospect hears dead air. Silent was
+// the wrong behaviour; the drop has to be observable.
+
+const OPEN = 1
+const CLOSED = 3
+
+it('sends an event when the socket is open', () => {
+  const sent: string[] = []
+  const ok = sendJson({ readyState: OPEN, send: (d) => sent.push(d) }, { type: 'response.create' })
+  expect(ok).toBe(true)
+  expect(sent).toEqual(['{"type":"response.create"}'])
+})
+
+it('reports and logs a drop when the socket is not open', () => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  const sent: string[] = []
+  const ok = sendJson({ readyState: CLOSED, send: (d) => sent.push(d) },
+    { type: 'conversation.item.create' })
+  expect(ok).toBe(false)
+  expect(sent).toEqual([])
+  expect(warn).toHaveBeenCalledWith(expect.stringContaining('conversation.item.create'))
+  warn.mockRestore()
 })
