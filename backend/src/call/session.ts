@@ -42,7 +42,8 @@ export class CallSession {
   private started = false
   private finished = false
   private agentSpeaking = false
-  private prospectSpeaking = false
+  // Prospect speech state lives in AudioAccounting, which is what consumes it.
+  // Duplicating it here would be a second source of truth for the same fact.
   private disposition = DEFAULT_DISPOSITION
   private voicemailDropped = false
   private amdVerdict: string | null = null
@@ -90,18 +91,18 @@ export class CallSession {
         return
 
       case 'prospect_speech_started':
-        this.prospectSpeaking = true
         this.audio.noteProspectSpeechStart()
         // Barge-in: flush what Twilio has queued, then stop the model mid-response.
         if (this.agentSpeaking) {
-          this.sendToTwilio(clearMessage(this.streamSid ?? ''))
+          // Cancelling the model does not depend on having a stream; sending to
+          // Twilio does.
+          if (this.streamSid !== null) this.sendToTwilio(clearMessage(this.streamSid))
           this.opts.realtime.cancelResponse()
           this.agentSpeaking = false
         }
         return
 
       case 'prospect_speech_stopped':
-        this.prospectSpeaking = false
         this.audio.noteProspectSpeechStop()
         return
 
@@ -121,7 +122,9 @@ export class CallSession {
 
       case 'error':
         console.error('[session] realtime error', e.message)
-        this.disposition = 'failed'
+        // Do NOT set this.disposition here. end()'s guard exists to stop a
+        // default close from clobbering a real outcome; pre-setting the field
+        // defeats it, and a call that booked a meeting would persist as failed.
         this.end('failed')
         return
 
@@ -132,13 +135,20 @@ export class CallSession {
   }
 
   private sendAgentAudio(payloadB64: string): void {
+    // Symmetric to the inbound guard in handleTwilioMessage. Without a streamSid
+    // there is no stream to route this to and Twilio discards the frame in
+    // silence, so drop it here rather than pretend it was delivered.
+    if (!this.started || this.streamSid === null) return
+
+    const bytes = Buffer.from(payloadB64, 'base64').length
+    if (bytes === 0) return // an empty delta is not 20 ms of speech
+
     if (!this.agentSpeaking) {
       this.agentSpeaking = true
       this.audio.noteAgentAudioStart()
     }
-    const frames = Math.max(1, Math.ceil(Buffer.from(payloadB64, 'base64').length / ULAW_FRAME_BYTES))
-    this.audio.noteOutboundFrames(frames)
-    this.sendToTwilio(mediaMessage(this.streamSid ?? '', payloadB64))
+    this.audio.noteOutboundFrames(Math.ceil(bytes / ULAW_FRAME_BYTES))
+    this.sendToTwilio(mediaMessage(this.streamSid, payloadB64))
   }
 
   private async runTool(toolCallId: string, name: string, args: Record<string, unknown>): Promise<void> {

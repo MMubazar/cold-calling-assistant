@@ -204,3 +204,38 @@ it('ignores malformed Twilio messages without throwing', () => {
   expect(() => { t.inject('{broken'); t.inject(JSON.stringify({ event: 'dtmf' })) }).not.toThrow()
   expect(session.result().disposition).toBe('failed')
 })
+
+// A booked meeting exists in the database. Nothing that happens afterwards may
+// cause the call to be recorded as anything other than booked.
+it('keeps disposition booked when end_call follows a successful booking', async () => {
+  const { session, t, r } = build()
+  t.inject(startMessage())
+  r.emit({ kind: 'tool_call', toolCallId: 'fc1', name: 'book_meeting', args: { slot_id: 's1' } })
+  await session.settled()
+  r.emit({ kind: 'tool_call', toolCallId: 'fc2', name: 'end_call', args: { reason: 'done' } })
+  await session.settled()
+  expect(session.result().disposition).toBe('booked')
+})
+
+it('keeps disposition booked when the model session errors after a booking', async () => {
+  const { session, t, r } = build()
+  t.inject(startMessage())
+  r.emit({ kind: 'tool_call', toolCallId: 'fc1', name: 'book_meeting', args: { slot_id: 's1' } })
+  await session.settled()
+  r.emit({ kind: 'error', message: 'socket died' })
+  expect(session.result().disposition).toBe('booked')
+})
+
+it('sends nothing to Twilio when model audio arrives before the start event', () => {
+  const { session, t, r } = build()
+  r.emit({ kind: 'audio', payload: 'BBBB' })
+  expect(t.sent).toEqual([])
+  expect(session.result().audio.agentMs).toBe(0)
+})
+
+it('does not count an empty audio delta as 20 ms of speech', () => {
+  const { session, t, r } = build()
+  t.inject(startMessage())
+  r.emit({ kind: 'audio', payload: '' })
+  expect(session.result().audio.agentMs).toBe(0)
+})
