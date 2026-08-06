@@ -1,4 +1,4 @@
-import { parseTwilioMessage, mediaMessage, clearMessage } from '../media/twilio-frames.js'
+import { parseTwilioMessage, mediaMessage, clearMessage, markMessage } from '../media/twilio-frames.js'
 import { AudioAccounting, type AudioSnapshot, ULAW_FRAME_BYTES } from '../media/audio.js'
 import { handleToolCall } from '../agent/tool-handlers.js'
 import type { RealtimeClient, RealtimeEvent } from '../agent/realtime.js'
@@ -68,11 +68,14 @@ export class CallSession {
       case 'media':
         if (!this.started) return
         this.audio.noteInboundFrame()
-        // Task 10 owns real voicemail-abort handling; for now this mode is never entered.
-        if (this.mode === 'voicemail') return
+        if (this.mode === 'voicemail') {
+          this.abortVoicemailDrop()
+          return
+        }
         this.opts.realtime.sendAudio(msg.payload)
         return
       case 'mark':
+        if (msg.name === 'voicemail-complete') this.end('voicemail')
         return
       case 'stop':
         this.finish()
@@ -149,6 +152,65 @@ export class CallSession {
     }
     this.audio.noteOutboundFrames(Math.ceil(bytes / ULAW_FRAME_BYTES))
     this.sendToTwilio(mediaMessage(this.streamSid, payloadB64))
+  }
+
+  /**
+   * Async AMD verdict (spec §7). Arrives after the stream is already open, which is why
+   * async detection is used — synchronous detection would delay every human-answered call
+   * by 2–4 s and blow the latency budget in spec §5.
+   */
+  applyAmdVerdict(verdict: string): void {
+    if (this.finished) return
+    this.amdVerdict = verdict
+    if (!verdict.startsWith('machine')) return
+
+    this.mode = 'voicemail'
+    this.opts.realtime.close()
+
+    if (this.agentSpeaking) {
+      if (this.streamSid !== null) this.sendToTwilio(clearMessage(this.streamSid))
+      this.agentSpeaking = false
+    }
+
+    // Symmetric to the guards in sendAgentAudio/handleRealtimeEvent's barge-in path: a
+    // frame with no stream to route to is silently dropped by Twilio, so treat "no
+    // stream" the same as "no audio configured" rather than sending into the void.
+    if (this.streamSid === null) {
+      console.warn('[voicemail] no active stream; ending call without playing the message')
+      this.end('voicemail')
+      return
+    }
+
+    if (this.opts.voicemailFrames.length === 0) {
+      console.warn('[voicemail] no audio configured; ending call without a message')
+      this.end('voicemail')
+      return
+    }
+
+    this.voicemailDropped = true
+    for (const frame of this.opts.voicemailFrames) {
+      this.sendToTwilio(mediaMessage(this.streamSid, frame))
+    }
+    this.sendMark('voicemail-complete')
+  }
+
+  /**
+   * A human speaking during voicemail playback is unambiguous evidence that machine
+   * detection misfired (spec §7). Abort, keep the call alive, and record the false positive
+   * so it is countable rather than invisible.
+   */
+  private abortVoicemailDrop(): void {
+    console.warn('[voicemail] speech during playback; treating AMD verdict as a false positive')
+    this.mode = 'conversation'
+    this.voicemailDropped = false
+    this.amdVerdict = `${this.amdVerdict ?? 'machine'}_false_positive`
+    if (this.streamSid !== null) this.sendToTwilio(clearMessage(this.streamSid))
+  }
+
+  /** Guarded like sendAgentAudio: without a stream there is nowhere to route this. */
+  private sendMark(name: string): void {
+    if (this.streamSid === null) return
+    this.sendToTwilio(markMessage(this.streamSid, name))
   }
 
   private async runTool(toolCallId: string, name: string, args: Record<string, unknown>): Promise<void> {
