@@ -2,7 +2,9 @@ import {
   buildTwiml,
   createCallHandler,
   parseStatsPath,
+  readBody,
   socketTransport,
+  BodyTooLarge,
   statsPayload,
 } from '../src/server.js'
 import type { CallResult } from '../src/call/session.js'
@@ -174,6 +176,20 @@ it('replays buffered messages in arrival order on flush', () => {
   transport.onMessage((raw) => seen.push(raw))
   transport.flush()
   expect(seen).toEqual(['one', 'two'])
+})
+
+// readBody takes an async iterable so the cap is testable without a socket.
+async function* body(...chunks: string[]) {
+  for (const c of chunks) yield Buffer.from(c)
+}
+
+it('reads a body that fits under the cap', async () => {
+  expect(await readBody(body('{"a":', '1}'))).toBe('{"a":1}')
+})
+
+it('refuses a body over the cap instead of buffering it', async () => {
+  const oversized = body('x'.repeat(40 * 1024), 'y'.repeat(40 * 1024))
+  await expect(readBody(oversized)).rejects.toBeInstanceOf(BodyTooLarge)
 })
 
 it('does not let a late message overtake ones already buffered', () => {

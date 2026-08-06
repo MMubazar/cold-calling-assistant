@@ -153,16 +153,27 @@ const MAX_BODY_BYTES = 64 * 1024
 
 export class BodyTooLarge extends Error {}
 
-async function readBody(req: IncomingMessage): Promise<string> {
+/**
+ * Reads a request body, refusing to buffer more than the cap.
+ *
+ * Deliberately does NOT destroy the request: in HTTP/1.x the request and the
+ * response share a socket, so tearing it down here means the 413 never reaches
+ * the caller — they see a hang-up instead of a status code. The dispatcher
+ * responds first and closes afterwards.
+ *
+ * Takes an async iterable rather than an IncomingMessage so the cap is testable
+ * without a socket.
+ */
+export async function readBody(source: AsyncIterable<Buffer | string>): Promise<string> {
   const chunks: Buffer[] = []
   let total = 0
-  for await (const c of req) {
-    total += (c as Buffer).length
+  for await (const c of source) {
+    const chunk = typeof c === 'string' ? Buffer.from(c) : c
+    total += chunk.length
     if (total > MAX_BODY_BYTES) {
-      req.destroy()
       throw new BodyTooLarge(`body exceeded ${MAX_BODY_BYTES} bytes`)
     }
-    chunks.push(c as Buffer)
+    chunks.push(chunk)
   }
   return Buffer.concat(chunks).toString()
 }
@@ -247,7 +258,12 @@ export async function startServer(env: Env): Promise<void> {
     } catch (err) {
       if (err instanceof BodyTooLarge) {
         console.warn(`[http] rejected oversized body on ${url.pathname}`)
-        return json(res, 413, { error: 'request body too large' })
+        // Respond BEFORE abandoning the request. The two share a socket, so
+        // destroying the request first would replace the 413 with a hang-up.
+        res.writeHead(413, { 'content-type': 'application/json', connection: 'close' })
+        res.end(JSON.stringify({ error: 'request body too large' }))
+        req.destroy()
+        return
       }
       console.error('[http] handler failed', err)
       return json(res, 500, { error: 'internal error' })
