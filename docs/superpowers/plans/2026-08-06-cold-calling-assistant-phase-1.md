@@ -2313,7 +2313,11 @@ export class CallSession {
         this.opts.realtime.sendAudio(msg.payload)
         return
       case 'mark':
-        if (msg.name === 'voicemail-complete') this.end('voicemail')
+        // Guard on the mode: a mark already in flight when an abort fires would
+        // otherwise hang up on the human the abort just decided to keep.
+        if (msg.name === 'voicemail-complete' && this.mode === 'voicemail') {
+          this.end('voicemail')
+        }
         return
       case 'stop':
         this.finish()
@@ -2508,7 +2512,13 @@ This is spec §7. The false-positive abort is the part most likely to matter on 
 `backend/tests/ulaw.test.ts`:
 
 ```ts
-import { encodePcm16ToUlaw, chunkUlawToFrames } from '../src/media/ulaw.js'
+import {
+  encodePcm16ToUlaw,
+  chunkUlawToFrames,
+  decodeUlawByte,
+  frameEnergy,
+  SPEECH_ENERGY_THRESHOLD,
+} from '../src/media/ulaw.js'
 import { ULAW_FRAME_BYTES } from '../src/media/audio.js'
 
 it('encodes one μ-law byte per PCM sample', () => {
@@ -2539,6 +2549,32 @@ it('pads a trailing partial frame to a full frame', () => {
 
 it('returns no frames for an empty buffer', () => {
   expect(chunkUlawToFrames(Buffer.alloc(0))).toEqual([])
+})
+
+it('decodes a μ-law byte back to its original sample', () => {
+  for (const sample of [0, 100, -100, 5000, -5000, 30000, -30000]) {
+    const [byte] = encodePcm16ToUlaw(new Int16Array([sample]))
+    const decoded = decodeUlawByte(byte!)
+    // μ-law is lossy by design; 4 % of full scale is well inside its error band.
+    expect(Math.abs(decoded - sample)).toBeLessThan(1300)
+    expect(Math.sign(decoded)).toBe(Math.sign(sample))
+  }
+})
+
+it('reports zero energy for a silent frame', () => {
+  const silence = encodePcm16ToUlaw(new Int16Array(160)).toString('base64')
+  expect(frameEnergy(silence)).toBeLessThan(SPEECH_ENERGY_THRESHOLD)
+})
+
+it('reports energy above the speech threshold for a loud frame', () => {
+  const loud = new Int16Array(160)
+  for (let i = 0; i < loud.length; i++) loud[i] = i % 2 === 0 ? 8000 : -8000
+  expect(frameEnergy(encodePcm16ToUlaw(loud).toString('base64')))
+    .toBeGreaterThan(SPEECH_ENERGY_THRESHOLD)
+})
+
+it('reports zero energy for an empty payload', () => {
+  expect(frameEnergy('')).toBe(0)
 })
 ```
 
@@ -2592,6 +2628,41 @@ export function chunkUlawToFrames(buf: Buffer): string[] {
   }
   return frames
 }
+
+/** Decode one μ-law byte back to a 16-bit sample. Inverse of the encoder above. */
+export function decodeUlawByte(byte: number): number {
+  const u = ~byte & 0xff
+  const sign = u & 0x80
+  const exponent = (u >> 4) & 0x07
+  const mantissa = u & 0x0f
+  const sample = (((mantissa << 3) + BIAS) << exponent) - BIAS
+  return sign ? -sample : sample
+}
+
+/**
+ * Mean absolute amplitude of one base64 μ-law frame, 0–32635.
+ *
+ * This exists because Twilio streams inbound audio continuously whether or not
+ * anyone is speaking (see media/audio.ts). During a voicemail drop the model
+ * session is closed, so there is no VAD to consult — "a frame arrived" cannot
+ * stand in for "a human spoke", and energy is the only signal left.
+ */
+export function frameEnergy(payloadB64: string): number {
+  const buf = Buffer.from(payloadB64, 'base64')
+  if (buf.length === 0) return 0
+  let total = 0
+  for (const byte of buf) total += Math.abs(decodeUlawByte(byte))
+  return total / buf.length
+}
+
+/**
+ * Mean amplitude above which a frame counts as sound rather than line noise.
+ * Tune against real calls; the runbook says how.
+ */
+export const SPEECH_ENERGY_THRESHOLD = 500
+
+/** Consecutive loud frames required before believing a human is there: 200 ms. */
+export const SPEECH_FRAMES_TO_ABORT = 10
 
 export async function loadVoicemailFrames(path: string): Promise<string[]> {
   try {
@@ -2689,6 +2760,7 @@ Expected: a file of roughly 24000 bytes (3 s × 8000 bytes/s).
 import { CallSession, type Transport } from '../src/call/session.js'
 import type { RealtimeClient, RealtimeEvent } from '../src/agent/realtime.js'
 import type { Db } from '../src/lib/db.js'
+import { encodePcm16ToUlaw, SPEECH_FRAMES_TO_ABORT } from '../src/media/ulaw.js'
 
 function harness(voicemailFrames = ['VM1', 'VM2', 'VM3']) {
   const sent: string[] = []
@@ -2721,12 +2793,23 @@ function harness(voicemailFrames = ['VM1', 'VM2', 'VM3']) {
     start: { streamSid: 'MZ1', callSid: 'CA1', customParameters: { callId: 'c1' } },
   }))
 
-  const media = () => onMsg(JSON.stringify({
-    event: 'media', streamSid: 'MZ1', media: { track: 'inbound', payload: 'AAAA' },
+  // A full frame of μ-law silence, and one of loud tone. Energy, not mere
+  // arrival, is what decides whether a human is on the line.
+  const SILENT = encodePcm16ToUlaw(new Int16Array(160)).toString('base64')
+  const loudSamples = new Int16Array(160)
+  for (let i = 0; i < loudSamples.length; i++) loudSamples[i] = i % 2 === 0 ? 8000 : -8000
+  const LOUD = encodePcm16ToUlaw(loudSamples).toString('base64')
+
+  const frame = (payload: string) => onMsg(JSON.stringify({
+    event: 'media', streamSid: 'MZ1', media: { track: 'inbound', payload },
   }))
+  /** Twilio's continuous silence: what an answered-but-quiet line actually sends. */
+  const silence = (n = SPEECH_FRAMES_TO_ABORT * 3) => { for (let i = 0; i < n; i++) frame(SILENT) }
+  /** Sustained speech, enough to trip the abort threshold. */
+  const speak = (n = SPEECH_FRAMES_TO_ABORT) => { for (let i = 0; i < n; i++) frame(LOUD) }
   const mark = (name: string) => onMsg(JSON.stringify({ event: 'mark', mark: { name } }))
 
-  return { session, sent, rtCalls, emit, media, mark }
+  return { session, sent, rtCalls, emit, frame, silence, speak, mark, SILENT, LOUD }
 }
 
 const events = (sent: string[]) => sent.map((s) => JSON.parse(s).event)
@@ -2780,14 +2863,40 @@ it('sets disposition voicemail once playback completes', () => {
 it('stops forwarding audio to the model during voicemail mode', () => {
   const h = harness()
   h.session.applyAmdVerdict('machine_start')
-  h.media()
-  expect(h.rtCalls).not.toContain('audio:AAAA')
+  h.speak()
+  expect(h.rtCalls.some((c) => c.startsWith('audio:'))).toBe(false)
 })
 
-it('aborts the drop when the prospect speaks during playback — AMD false positive', () => {
+// The defect this replaced: aborting on any inbound frame. Twilio streams silence
+// continuously, so that aborted every drop about 20 ms in and the feature was dead.
+it('does not abort on continuous silence, which Twilio always sends', () => {
   const h = harness()
   h.session.applyAmdVerdict('machine_start')
-  h.media()
+  h.silence()
+  expect(h.session.result().voicemailDropped).toBe(true)
+  expect(h.session.result().amdVerdict).toBe('machine_start')
+})
+
+it('does not abort on a brief noise burst below the sustained threshold', () => {
+  const h = harness()
+  h.session.applyAmdVerdict('machine_start')
+  h.speak(SPEECH_FRAMES_TO_ABORT - 1)
+  expect(h.session.result().voicemailDropped).toBe(true)
+})
+
+it('resets the run when speech is interrupted by silence', () => {
+  const h = harness()
+  h.session.applyAmdVerdict('machine_start')
+  h.speak(SPEECH_FRAMES_TO_ABORT - 1)
+  h.silence(1)
+  h.speak(SPEECH_FRAMES_TO_ABORT - 1)
+  expect(h.session.result().voicemailDropped).toBe(true)
+})
+
+it('aborts the drop on sustained speech during playback — AMD false positive', () => {
+  const h = harness()
+  h.session.applyAmdVerdict('machine_start')
+  h.speak()
   expect(h.session.result().voicemailDropped).toBe(false)
   expect(h.session.result().disposition).not.toBe('voicemail')
 })
@@ -2795,16 +2904,24 @@ it('aborts the drop when the prospect speaks during playback — AMD false posit
 it('resumes forwarding audio to the model after an aborted drop', () => {
   const h = harness()
   h.session.applyAmdVerdict('machine_start')
-  h.media()          // triggers the abort
-  h.media()          // this one must reach the model
-  expect(h.rtCalls).toContain('audio:AAAA')
+  h.speak()            // trips the abort
+  h.frame(h.LOUD)      // this one must reach the model
+  expect(h.rtCalls).toContain(`audio:${h.LOUD}`)
 })
 
 it('keeps the verdict on record after an abort so false positives are countable', () => {
   const h = harness()
   h.session.applyAmdVerdict('machine_start')
-  h.media()
+  h.speak()
   expect(h.session.result().amdVerdict).toBe('machine_start_false_positive')
+})
+
+it('ignores a voicemail-complete mark that lands after an abort', () => {
+  const h = harness()
+  h.session.applyAmdVerdict('machine_start')
+  h.speak()                    // abort: a human is on the line
+  h.mark('voicemail-complete') // a mark already in flight
+  expect(h.session.result().disposition).not.toBe('voicemail')
 })
 
 it('ignores a verdict arriving after the call already finished', () => {
@@ -2877,18 +2994,40 @@ In `backend/src/call/session.ts`, replace the placeholder `abortVoicemailDrop` a
   }
 ```
 
-Also change the `media` branch of `handleTwilioMessage` so that the frame which triggers the abort is not itself dropped:
+Also change the `media` branch of `handleTwilioMessage`. The abort must be driven by
+**sustained energy**, not by a frame merely arriving: Twilio streams inbound audio
+continuously whether anyone speaks or not, and during a voicemail drop the model
+session is closed so there is no VAD to consult. Gating on frame arrival would abort
+the drop about 20 ms after every machine verdict, which makes the whole feature dead.
 
 ```ts
       case 'media':
         if (!this.started) return
         this.audio.noteInboundFrame()
         if (this.mode === 'voicemail') {
-          this.abortVoicemailDrop()
+          if (frameEnergy(msg.payload) >= SPEECH_ENERGY_THRESHOLD) {
+            this.loudFrames += 1
+            if (this.loudFrames >= SPEECH_FRAMES_TO_ABORT) this.abortVoicemailDrop()
+          } else {
+            this.loudFrames = 0 // a gap resets it; only sustained sound counts
+          }
           return
         }
         this.opts.realtime.sendAudio(msg.payload)
         return
+```
+
+Add the counter alongside the other private fields, and reset it when a drop starts:
+
+```ts
+  /** Consecutive above-threshold inbound frames while playing a voicemail. */
+  private loudFrames = 0
+```
+
+Import the three new helpers from `../media/ulaw.js`:
+
+```ts
+import { frameEnergy, SPEECH_ENERGY_THRESHOLD, SPEECH_FRAMES_TO_ABORT } from '../media/ulaw.js'
 ```
 
 The realtime client is closed on a machine verdict, so an aborted drop cannot resume the model
@@ -2997,7 +3136,13 @@ export async function persistCallResult(
 `backend/tests/server-routes.test.ts`:
 
 ```ts
-import { buildTwiml, createCallHandler, parseStatsPath, statsPayload } from '../src/server.js'
+import {
+  buildTwiml,
+  createCallHandler,
+  parseStatsPath,
+  socketTransport,
+  statsPayload,
+} from '../src/server.js'
 import type { CallResult } from '../src/call/session.js'
 import type { Db } from '../src/lib/db.js'
 
@@ -3071,7 +3216,7 @@ it('falls back to the lead phone when no destination is supplied', async () => {
 it('requests async machine detection so connection is never delayed', async () => {
   const d = deps()
   await d.handler({ leadId: 'l1', to: '+923001234567' })
-  expect(d.created[0].machineDetection).toBe('Enable')
+  expect(d.created[0].machineDetection).toBe('DetectMessageEnd')
   expect(String(d.created[0].asyncAmd)).toBe('true')
   expect(d.created[0].asyncAmdStatusCallback).toContain('/amd')
 })
@@ -3125,6 +3270,59 @@ it('reports zeroed counters before anyone has spoken', () => {
     amdVerdict: null,
   }
   expect(statsPayload(result)).toMatchObject({ agentMs: 0, prospectMs: 0, talkRatio: 0 })
+})
+
+// The buffering transport is what stops Twilio's first second of audio being
+// dropped while the session is still connecting. It is testable without a socket.
+
+function fakeWs() {
+  const sent: string[] = []
+  const listeners: Record<string, ((d: unknown) => void)[]> = {}
+  const ws = {
+    OPEN: 1,
+    readyState: 1,
+    send: (raw: string) => { sent.push(raw) },
+    close: () => {},
+    on: (event: string, cb: (d: unknown) => void) => { (listeners[event] ??= []).push(cb) },
+    off: () => {},
+  }
+  return {
+    ws: ws as unknown as Parameters<typeof socketTransport>[0],
+    sent,
+    deliver: (raw: string) => (listeners.message ?? []).forEach((cb) => cb(raw)),
+  }
+}
+
+it('holds messages that arrive before a handler is attached', () => {
+  const f = fakeWs()
+  const transport = socketTransport(f.ws)
+  f.deliver('one')
+  f.deliver('two')
+  const seen: string[] = []
+  transport.onMessage((raw) => seen.push(raw))
+  expect(seen).toEqual([]) // still buffered — flush has not run
+})
+
+it('replays buffered messages in arrival order on flush', () => {
+  const f = fakeWs()
+  const transport = socketTransport(f.ws)
+  f.deliver('one')
+  f.deliver('two')
+  const seen: string[] = []
+  transport.onMessage((raw) => seen.push(raw))
+  transport.flush()
+  expect(seen).toEqual(['one', 'two'])
+})
+
+it('does not let a late message overtake ones already buffered', () => {
+  const f = fakeWs()
+  const transport = socketTransport(f.ws)
+  f.deliver('first')
+  const seen: string[] = []
+  transport.onMessage((raw) => seen.push(raw))
+  f.deliver('second') // arrives after the handler but before flush
+  transport.flush()
+  expect(seen).toEqual(['first', 'second'])
 })
 ```
 
@@ -3222,7 +3420,12 @@ export function createCallHandler(deps: CallHandlerDeps) {
         statusCallbackEvent: ['completed'],
         // Async so the media stream opens immediately; sync detection would add 2-4 s to
         // every human-answered call (spec §7).
-        machineDetection: 'Enable',
+        // DetectMessageEnd, not Enable: 'Enable' reports machine_start when the
+        // greeting BEGINS, so we would talk over it and the voicemail drop's
+        // energy gate would see the machine's own greeting and abort. Waiting for
+        // the greeting to end costs nothing on human-answered calls because the
+        // detection is async — only the verdict is delayed, never the connection.
+        machineDetection: 'DetectMessageEnd',
         asyncAmd: 'true',
         asyncAmdStatusCallback: `${base}/amd?callId=${call.id}`,
         asyncAmdStatusCallbackMethod: 'POST',
@@ -3241,18 +3444,64 @@ export function createCallHandler(deps: CallHandlerDeps) {
 interface Live { session: CallSession; startedAtMs: number }
 const live = new Map<string, Live>()
 
-function socketTransport(ws: WebSocket): Transport {
+/** AMD verdicts that arrived before their session finished connecting. */
+const earlyVerdicts = new Map<string, string>()
+
+export interface BufferingTransport extends Transport {
+  /** Deliver everything received so far, in order, then stream live. */
+  flush(): void
+}
+
+/**
+ * Buffers from the moment the socket opens.
+ *
+ * Twilio starts streaming audio immediately, but building a session needs three
+ * database round trips and a realtime handshake. Without buffering there is no
+ * listener attached during that window and the frames are simply lost — `ws`
+ * queues nothing — costing the prospect's first second or two of speech on every
+ * single call.
+ */
+export function socketTransport(ws: WebSocket): BufferingTransport {
+  const queued: string[] = []
+  let handler: ((raw: string) => void) | null = null
+  let flushed = false
+
+  ws.on('message', (d) => {
+    const raw = d.toString()
+    // Keep queueing until flush, so a message arriving between session
+    // construction and flush cannot overtake the ones already waiting.
+    if (flushed && handler) handler(raw)
+    else queued.push(raw)
+  })
+
   return {
     send: (raw) => { if (ws.readyState === ws.OPEN) ws.send(raw) },
     close: () => ws.close(),
-    onMessage: (cb) => ws.on('message', (d) => cb(d.toString())),
+    onMessage: (cb) => { handler = cb },
     onClose: (cb) => ws.on('close', cb),
+    flush: () => {
+      flushed = true
+      for (const raw of queued.splice(0)) handler?.(raw)
+    },
   }
 }
 
+/** 64 KiB. These routes are reachable through a public tunnel. */
+const MAX_BODY_BYTES = 64 * 1024
+
+export class BodyTooLarge extends Error {}
+
 async function readBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = []
-  for await (const c of req) chunks.push(c as Buffer)
+  let total = 0
+  for await (const c of req) {
+    total += (c as Buffer).length
+    if (total > MAX_BODY_BYTES) {
+      req.destroy()
+      throw new BodyTooLarge(`body exceeded ${MAX_BODY_BYTES} bytes`)
+    }
+    chunks.push(c as Buffer)
+  }
   return Buffer.concat(chunks).toString()
 }
 
@@ -3295,17 +3544,30 @@ export async function startServer(env: Env): Promise<void> {
       if (req.method === 'POST' && url.pathname === '/amd') {
         const verdict = parseForm(await readBody(req)).AnsweredBy ?? 'unknown'
         console.log(`[amd] call=${callId} verdict=${verdict}`)
-        live.get(callId)?.session.applyAmdVerdict(verdict)
+        const entry = live.get(callId)
+        if (entry) {
+          entry.session.applyAmdVerdict(verdict)
+        } else {
+          // AMD detection and the media handshake are independent races off the
+          // same answer event. A verdict that wins is held for the session to
+          // collect, not discarded — dropping it would treat a machine as human
+          // and silently defeat the voicemail drop.
+          console.warn(`[amd] call=${callId} verdict arrived before the session; holding it`)
+          earlyVerdicts.set(callId, verdict)
+        }
         return json(res, 200, { ok: true })
       }
 
       if (req.method === 'POST' && url.pathname === '/status') {
         await readBody(req)
+        // Delete before awaiting: the socket close and this callback are both
+        // triggered by the call ending, so whichever arrives second must find
+        // nothing left to persist. Map.delete returning true is the claim.
         const entry = live.get(callId)
-        if (entry) {
+        if (entry && live.delete(callId)) {
           await persistCallResult(db, callId, entry.session.result(), entry.startedAtMs)
-          live.delete(callId)
         }
+        earlyVerdicts.delete(callId)
         return json(res, 200, { ok: true })
       }
 
@@ -3321,6 +3583,10 @@ export async function startServer(env: Env): Promise<void> {
 
       return json(res, 404, { error: 'not found' })
     } catch (err) {
+      if (err instanceof BodyTooLarge) {
+        console.warn(`[http] rejected oversized body on ${url.pathname}`)
+        return json(res, 413, { error: 'request body too large' })
+      }
       console.error('[http] handler failed', err)
       return json(res, 500, { error: 'internal error' })
     }
@@ -3329,12 +3595,19 @@ export async function startServer(env: Env): Promise<void> {
   const wss = new WebSocketServer({ server, path: '/media' })
 
   wss.on('connection', (ws) => {
-    // The callId arrives in the start event's customParameters, so hold the socket
-    // until then before building the session.
-    const onFirst = async (data: unknown) => {
+    // Buffering starts the instant the socket opens, before any await, so nothing
+    // Twilio sends during setup is lost.
+    const transport = socketTransport(ws)
+    let starting = false
+
+    // A second listener that only observes. The callId arrives in the start
+    // event's customParameters and is needed before a session can be built.
+    const detectStart = async (data: unknown) => {
+      if (starting) return
       const msg = parseTwilioMessage(String(data))
       if (msg?.event !== 'start') return
-      ws.off('message', onFirst)
+      starting = true
+      ws.off('message', detectStart)
 
       const callId = msg.customParameters.callId ?? ''
       const startedAtMs = Date.now()
@@ -3358,26 +3631,39 @@ export async function startServer(env: Env): Promise<void> {
         })
 
         const session = new CallSession({
-          transport: socketTransport(ws), realtime, db, callId, leadId: lead.id, slots, voicemailFrames,
+          transport, realtime, db, callId, leadId: lead.id, slots, voicemailFrames,
         })
         live.set(callId, { session, startedAtMs })
 
         session.onFinished(() => {
-          void persistCallResult(db, callId, session.result(), startedAtMs)
-            .then(() => live.delete(callId))
+          // Claim the entry first; /status may be racing us for the same call.
+          if (live.delete(callId)) {
+            void persistCallResult(db, callId, session.result(), startedAtMs)
+          }
+          earlyVerdicts.delete(callId)
         })
 
-        // Replay the start event the session did not see while we were setting up.
-        session.handleTwilioMessage(String(data))
+        // Releases the start event and every frame buffered since, in order.
+        transport.flush()
+
+        // A verdict that beat the handshake was held rather than dropped.
+        const held = earlyVerdicts.get(callId)
+        if (held !== undefined) {
+          earlyVerdicts.delete(callId)
+          console.log(`[amd] call=${callId} applying held verdict=${held}`)
+          session.applyAmdVerdict(held)
+        }
+
         realtime.requestResponse()
         console.log(`[media] session live call=${callId} lead=${lead.name}`)
       } catch (err) {
         console.error('[media] failed to start session', err)
+        earlyVerdicts.delete(callId)
         ws.close()
       }
     }
 
-    ws.on('message', onFirst)
+    ws.on('message', detectStart)
   })
 
   server.listen(env.port, () => {
@@ -3398,9 +3684,9 @@ if (process.argv[1]?.endsWith('server.ts')) {
 - [ ] **Step 7: Run the full suite to verify everything passes**
 
 Run: `cd backend && TEST_DATABASE_URL=postgres://sb@127.0.0.1:5470/coldcall_test npm test`
-Expected: all suites green — 13 test files, 137 tests (5 env, 9 allowlist, 7 twilio-frames,
-12 audio, 11 db, 9 playbook, 12 tool-handlers, 18 realtime, 19 session, 6 ulaw, 12 voicemail,
-2 teardown, 15 server-routes).
+Expected: all suites green — 13 test files, 151 tests (5 env, 9 allowlist, 7 twilio-frames,
+12 audio, 11 db, 9 playbook, 12 tool-handlers, 18 realtime, 19 session, 11 ulaw, 17 voicemail,
+2 teardown, 18 server-routes).
 
 - [ ] **Step 8: Typecheck**
 
