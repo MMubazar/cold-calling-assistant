@@ -24,6 +24,12 @@ These are deliberate changes made after checking the local environment. Each is 
 
 5. **`prospect_ms` is measured between the model's VAD events, not from raw inbound frame count.** Twilio streams inbound audio continuously whether or not anyone is speaking, so counting all inbound frames would measure call duration, not prospect talk time, and would make `talk_ratio` (spec §8) meaningless. Inbound frames are counted only while the model reports prospect speech active. Same fix makes `agent_interruptions` exact rather than heuristic.
 
+6. **The database runs as a user-owned cluster, not the system one.** The system Postgres has no `sb` role and creating one needs sudo, which is unavailable. A private cluster lives at `~/.coldcall-pg` on port 5470: `postgres://sb@127.0.0.1:5470/coldcall`, with `coldcall_test` alongside it for the test suite. Start it with `pg_ctl -D ~/.coldcall-pg -o "-p 5470 -k /tmp" start`.
+
+7. **The call server exposes live audio counters over HTTP** (`GET /calls/:id/stats`, Task 11). `finalizeCall` writes scores only at teardown, so without this the console's talk band would sit blank for the whole call and only fill in after hangup — losing its main readout at the moment it matters. The endpoint reads the in-memory `AudioAccounting`, so the one-write-at-call-end constraint is untouched.
+
+8. **The frontend was built during Phase 1, out of plan order,** while Task 5 was blocked on the database. It lives in `frontend/` (Next.js 15 App Router, handcrafted CSS) and reads the same cluster. Phases 2 and 3 still own the backend work that feeds it.
+
 ## Global Constraints
 
 - Node 20.19.4 is the installed runtime. Do not use APIs requiring Node 22+.
@@ -35,6 +41,7 @@ These are deliberate changes made after checking the local environment. Each is 
 - Twilio call recording stays **off** (spec §14).
 - No per-frame database writes. Counters accumulate in memory and are written once at call end (spec §9).
 - `book_meeting` is synchronous and idempotent per call. `save_qualification` is fire-and-forget and its failures are logged and swallowed (spec §5, §10).
+- **Database-touching tests read `TEST_DATABASE_URL`, never `DATABASE_URL`, and refuse to run if it is unset or names a database whose name does not end in `_test`.** These tests truncate tables; without this guard `npm test` silently destroys whatever the application database holds. Added after Task 5's review found the hazard had already fired once.
 - Nothing is deployed, pushed, or published. Commits are local only.
 - The realtime model id is read from `OPENAI_REALTIME_MODEL`. Never hardcode it — verify the current id against provider documentation before the acceptance call (spec §6).
 
@@ -326,7 +333,8 @@ TWILIO_AUTH_TOKEN=
 TWILIO_PHONE_NUMBER=+1...
 OPENAI_API_KEY=
 OPENAI_REALTIME_MODEL=
-DATABASE_URL=postgres://sb@localhost:5432/coldcall
+DATABASE_URL=postgres://sb@127.0.0.1:5470/coldcall
+TEST_DATABASE_URL=postgres://sb@127.0.0.1:5470/coldcall_test
 VERIFIED_NUMBERS=+92...
 PUBLIC_BASE_URL=https://your-tunnel.ngrok.app
 VOICEMAIL_AUDIO_PATH=./assets/voicemail.ulaw
@@ -897,15 +905,32 @@ Expected: seven tables listed.
 
 These tests hit the real local database. That is deliberate — the value here is verifying SQL, which a mock cannot do.
 
+They also **truncate tables**, so they must never point at the application
+database. The guard below is not optional: it is the difference between a test
+run and silent data loss.
+
 `backend/tests/db.test.ts`:
 
 ```ts
 import { createDb, type Db } from '../src/lib/db.js'
 
-const URL = process.env.DATABASE_URL ?? 'postgres://sb@localhost:5432/coldcall'
+// These tests truncate. Refuse to run anywhere but a dedicated test database.
+// Named TEST_URL, not URL, so it does not shadow the global URL class used below.
+const TEST_URL = process.env.TEST_DATABASE_URL
+if (!TEST_URL) {
+  throw new Error(
+    'TEST_DATABASE_URL is required. These tests truncate tables and must never run against ' +
+      'the application database. Try: ' +
+      'TEST_DATABASE_URL=postgres://sb@127.0.0.1:5470/coldcall_test npm test',
+  )
+}
+if (!new URL(TEST_URL).pathname.slice(1).endsWith('_test')) {
+  throw new Error(`Refusing to truncate "${TEST_URL}" — the database name must end in _test.`)
+}
+
 let db: Db
 
-beforeAll(() => { db = createDb(URL) })
+beforeAll(() => { db = createDb(TEST_URL) })
 afterAll(async () => { await db.close() })
 
 beforeEach(async () => {
@@ -980,12 +1005,65 @@ it('finalizes a call with disposition and scores', async () => {
   expect(rows[0]!.disposition).toBe('booked')
   expect(rows[0]!.talk_ratio).toBeCloseTo(0.4286, 3)
 })
+
+it('records the Twilio call sid against the call', async () => {
+  const callId = (await db.createCall(await seedLead())).id
+  await db.attachTwilioSid(callId, 'CA0001')
+  const rows = await db.query<{ twilio_sid: string }>(
+    'select twilio_sid from calls where id = $1', [callId])
+  expect(rows[0]!.twilio_sid).toBe('CA0001')
+})
+
+it('inserts a meeting and reads it back by call', async () => {
+  const leadId = await seedLead()
+  const callId = (await db.createCall(leadId)).id
+  await db.query(`insert into slots (starts_at) values (now() + interval '1 day')`, [])
+  const slot = (await db.getOpenSlots(1))[0]!
+
+  expect(await db.getMeetingByCall(callId)).toBeNull()
+  const meeting = await db.insertMeeting(callId, leadId, slot)
+  expect(meeting.slotId).toBe(slot.id)
+
+  const found = await db.getMeetingByCall(callId)
+  expect(found?.id).toBe(meeting.id)
+  expect(found?.startsAt.getTime()).toBe(slot.startsAt.getTime())
+})
+
+// This is the constraint that makes book_meeting idempotent. Without this test
+// the guarantee lives only in application code.
+it('refuses a second meeting for the same call', async () => {
+  const leadId = await seedLead()
+  const callId = (await db.createCall(leadId)).id
+  await db.query(`insert into slots (starts_at) values
+    (now() + interval '1 day'), (now() + interval '2 day')`, [])
+  const slots = await db.getOpenSlots(2)
+
+  await db.insertMeeting(callId, leadId, slots[0]!)
+  await expect(db.insertMeeting(callId, leadId, slots[1]!)).rejects.toThrow()
+
+  const rows = await db.query<{ n: string }>(
+    'select count(*)::text as n from meetings where call_id = $1', [callId])
+  expect(rows[0]!.n).toBe('1')
+})
+
+it('merges qualification fields across partial saves', async () => {
+  const callId = (await db.createCall(await seedLead())).id
+  await db.upsertQualification(callId, { need: 'high spoilage' })
+  await db.upsertQualification(callId, { timing: 'this quarter' })
+
+  const rows = await db.query<{ need: string | null; timing: string | null }>(
+    'select need, timing from qualifications where call_id = $1', [callId])
+  expect(rows[0]).toEqual({ need: 'high spoilage', timing: 'this quarter' })
+})
 ```
 
 - [ ] **Step 4: Run the test to verify it fails**
 
-Run: `cd backend && npx vitest run tests/db.test.ts`
+Run: `cd backend && TEST_DATABASE_URL=postgres://sb@127.0.0.1:5470/coldcall_test npx vitest run tests/db.test.ts`
 Expected: FAIL — module not found.
+
+Also confirm the guard works: running without `TEST_DATABASE_URL` must fail with the
+"TEST_DATABASE_URL is required" message rather than touching any database.
 
 - [ ] **Step 5: Implement the query layer**
 
@@ -1126,8 +1204,8 @@ export function createDb(databaseUrl: string): Db {
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `cd backend && DATABASE_URL=postgres://sb@localhost:5432/coldcall npx vitest run tests/db.test.ts`
-Expected: 7 passing.
+Run: `cd backend && TEST_DATABASE_URL=postgres://sb@127.0.0.1:5470/coldcall_test npx vitest run tests/db.test.ts`
+Expected: 11 passing.
 
 - [ ] **Step 7: Seed bookable slots**
 
@@ -2740,9 +2818,9 @@ git commit -m "feat: voicemail drop with false-positive abort on prospect speech
 
 **Interfaces:**
 - Consumes: everything above.
-- Produces: `buildTwiml(opts): string`, `createCallHandler(deps)`, `persistCallResult(db, callId, result, startedAtMs)`, and `startServer(env)`. This is the last task; nothing consumes it.
+- Produces: `buildTwiml(opts): string`, `createCallHandler(deps)`, `parseStatsPath(pathname)`, `statsPayload(result)`, `persistCallResult(db, callId, result, startedAtMs)`, and `startServer(env)`. This is the last task; nothing consumes it.
 
-One process serves `POST /calls`, `POST /twiml`, `POST /amd`, `POST /status`, and the `/media` WebSocket upgrade. A single ngrok tunnel therefore covers everything Twilio needs.
+One process serves `POST /calls`, `POST /twiml`, `POST /amd`, `POST /status`, `GET /calls/:id/stats`, and the `/media` WebSocket upgrade. A single ngrok tunnel therefore covers everything Twilio needs.
 
 The route handlers are extracted as pure-ish functions with injected dependencies so they can be tested without binding a port or holding a Twilio account.
 
@@ -2817,7 +2895,8 @@ export async function persistCallResult(
 `backend/tests/server-routes.test.ts`:
 
 ```ts
-import { buildTwiml, createCallHandler } from '../src/server.js'
+import { buildTwiml, createCallHandler, parseStatsPath, statsPayload } from '../src/server.js'
+import type { CallResult } from '../src/call/session.js'
 import type { Db } from '../src/lib/db.js'
 
 const ENV = {
@@ -2911,6 +2990,40 @@ it('returns 502 when Twilio rejects the call', async () => {
   const d = deps({ placeCall: async () => { throw new Error('twilio down') } })
   expect((await d.handler({ leadId: 'l1', to: '+923001234567' })).status).toBe(502)
 })
+
+it('parses a stats path to its call id', () => {
+  expect(parseStatsPath('/calls/abc-123/stats')).toBe('abc-123')
+})
+
+it('ignores paths that are not stats requests', () => {
+  expect(parseStatsPath('/calls')).toBeNull()
+  expect(parseStatsPath('/calls/abc-123')).toBeNull()
+  expect(parseStatsPath('/calls/abc/123/stats')).toBeNull()
+  expect(parseStatsPath('/status')).toBeNull()
+})
+
+it('exposes frame-derived counters without persisting them', () => {
+  const result: CallResult = {
+    disposition: 'failed',
+    audio: { agentMs: 4000, prospectMs: 6000, talkRatio: 0.4, agentInterruptions: 2 },
+    voicemailDropped: false,
+    amdVerdict: 'human',
+  }
+  expect(statsPayload(result)).toEqual({
+    agentMs: 4000, prospectMs: 6000, talkRatio: 0.4, agentInterruptions: 2,
+    disposition: 'failed', voicemailDropped: false, amdVerdict: 'human',
+  })
+})
+
+it('reports zeroed counters before anyone has spoken', () => {
+  const result: CallResult = {
+    disposition: 'failed',
+    audio: { agentMs: 0, prospectMs: 0, talkRatio: 0, agentInterruptions: 0 },
+    voicemailDropped: false,
+    amdVerdict: null,
+  }
+  expect(statsPayload(result)).toMatchObject({ agentMs: 0, prospectMs: 0, talkRatio: 0 })
+})
 ```
 
 - [ ] **Step 5: Run the tests to verify they fail**
@@ -2932,7 +3045,7 @@ import { isAllowed, normalizeE164 } from './lib/allowlist.js'
 import { buildInstructions } from './agent/playbook.js'
 import { connectRealtime } from './agent/realtime.js'
 import { loadVoicemailFrames } from './media/ulaw.js'
-import { CallSession, type Transport } from './call/session.js'
+import { CallSession, type CallResult, type Transport } from './call/session.js'
 import { persistCallResult } from './call/teardown.js'
 import { parseTwilioMessage } from './media/twilio-frames.js'
 
@@ -2952,6 +3065,25 @@ export function buildTwiml({ wsUrl, callId }: { wsUrl: string; callId: string })
     </Stream>
   </Connect>
 </Response>`
+}
+
+/** `/calls/<id>/stats` → `<id>`, or null for any other path. */
+export function parseStatsPath(pathname: string): string | null {
+  const match = /^\/calls\/([^/]+)\/stats$/.exec(pathname)
+  return match?.[1] ?? null
+}
+
+/** What the console reads mid-call. Frame-derived, never persisted. */
+export function statsPayload(result: CallResult): Record<string, unknown> {
+  return {
+    agentMs: result.audio.agentMs,
+    prospectMs: result.audio.prospectMs,
+    talkRatio: result.audio.talkRatio,
+    agentInterruptions: result.audio.agentInterruptions,
+    disposition: result.disposition,
+    voicemailDropped: result.voicemailDropped,
+    amdVerdict: result.amdVerdict,
+  }
 }
 
 export interface CallRequest { leadId?: string; to?: string }
@@ -3075,6 +3207,16 @@ export async function startServer(env: Env): Promise<void> {
         return json(res, 200, { ok: true })
       }
 
+      // Live audio counters, read from the in-memory session. The console's
+      // talk band needs these mid-call; call_scores is only written at
+      // teardown, so without this the band sits blank until hangup.
+      const statsFor = parseStatsPath(url.pathname)
+      if (req.method === 'GET' && statsFor !== null) {
+        const entry = live.get(statsFor)
+        if (!entry) return json(res, 404, { error: 'no live call with that id' })
+        return json(res, 200, statsPayload(entry.session.result()))
+      }
+
       return json(res, 404, { error: 'not found' })
     } catch (err) {
       console.error('[http] handler failed', err)
@@ -3153,10 +3295,10 @@ if (process.argv[1]?.endsWith('server.ts')) {
 
 - [ ] **Step 7: Run the full suite to verify everything passes**
 
-Run: `cd backend && DATABASE_URL=postgres://sb@localhost:5432/coldcall npm test`
-Expected: all suites green — 13 test files, 121 tests (5 env, 9 allowlist, 8 twilio-frames,
-12 audio, 7 db, 9 playbook, 12 tool-handlers, 13 realtime, 15 session, 6 ulaw, 12 voicemail,
-2 teardown, 11 server-routes).
+Run: `cd backend && TEST_DATABASE_URL=postgres://sb@127.0.0.1:5470/coldcall_test npm test`
+Expected: all suites green — 13 test files, 128 tests (5 env, 9 allowlist, 7 twilio-frames,
+12 audio, 11 db, 9 playbook, 12 tool-handlers, 13 realtime, 15 session, 6 ulaw, 12 voicemail,
+2 teardown, 15 server-routes).
 
 - [ ] **Step 8: Typecheck**
 
@@ -3309,7 +3451,7 @@ the model session alive through a false positive is Phase 2 work.
 
 - [ ] **Step 2: Run the full suite one more time before the live call**
 
-Run: `cd backend && DATABASE_URL=postgres://sb@localhost:5432/coldcall npm test && npm run typecheck`
+Run: `cd backend && TEST_DATABASE_URL=postgres://sb@127.0.0.1:5470/coldcall_test npm test && npm run typecheck`
 Expected: all green.
 
 - [ ] **Step 3: Execute test call 1 and record the results**
