@@ -1,0 +1,129 @@
+import { buildTwiml, createCallHandler, parseStatsPath, statsPayload } from '../src/server.js'
+import type { CallResult } from '../src/call/session.js'
+import type { Db } from '../src/lib/db.js'
+
+const ENV = {
+  publicBaseUrl: 'https://abc.ngrok.app',
+  twilioPhoneNumber: '+15550001111',
+  verifiedNumbers: ['+923001234567'],
+} as any
+
+function deps(overrides: Record<string, unknown> = {}) {
+  const created: any[] = []
+  return {
+    created,
+    handler: createCallHandler({
+      env: ENV,
+      db: {
+        getLead: async () => ({ id: 'l1', name: 'Ali', company: 'Acme', phone: '+923001234567' }),
+        createCall: async () => ({ id: 'call-1', leadId: 'l1' }),
+        attachTwilioSid: async () => {},
+        ...(overrides.db as object),
+      } as unknown as Db,
+      placeCall: async (args: unknown) => { created.push(args); return { sid: 'CA1' } },
+      ...overrides,
+    }),
+  }
+}
+
+it('builds TwiML that opens a bidirectional stream with the call id attached', () => {
+  const xml = buildTwiml({ wsUrl: 'wss://abc.ngrok.app/media', callId: 'call-1' })
+  expect(xml).toContain('<Connect>')
+  expect(xml).toContain('<Stream url="wss://abc.ngrok.app/media">')
+  expect(xml).toContain('<Parameter name="callId" value="call-1"/>')
+})
+
+it('escapes the call id in TwiML', () => {
+  expect(buildTwiml({ wsUrl: 'wss://x/media', callId: 'a&b' })).toContain('a&amp;b')
+})
+
+it('rejects a number that is not on the allowlist with 403 and never dials', async () => {
+  const d = deps()
+  const res = await d.handler({ leadId: 'l1', to: '+923009999999' })
+  expect(res.status).toBe(403)
+  expect(d.created).toEqual([])
+})
+
+it('rejects an unparseable number with 403', async () => {
+  const d = deps()
+  expect((await d.handler({ leadId: 'l1', to: 'garbage' })).status).toBe(403)
+})
+
+it('rejects a missing lead with 404 and never dials', async () => {
+  const d = deps({ db: { getLead: async () => null } })
+  const res = await d.handler({ leadId: 'nope', to: '+923001234567' })
+  expect(res.status).toBe(404)
+  expect(d.created).toEqual([])
+})
+
+it('dials an allowlisted number and returns the call id', async () => {
+  const d = deps()
+  const res = await d.handler({ leadId: 'l1', to: '+923001234567' })
+  expect(res.status).toBe(201)
+  expect((res.body as any).callId).toBe('call-1')
+})
+
+it('falls back to the lead phone when no destination is supplied', async () => {
+  const d = deps()
+  expect((await d.handler({ leadId: 'l1' })).status).toBe(201)
+  expect(d.created[0].to).toBe('+923001234567')
+})
+
+it('requests async machine detection so connection is never delayed', async () => {
+  const d = deps()
+  await d.handler({ leadId: 'l1', to: '+923001234567' })
+  expect(d.created[0].machineDetection).toBe('Enable')
+  expect(String(d.created[0].asyncAmd)).toBe('true')
+  expect(d.created[0].asyncAmdStatusCallback).toContain('/amd')
+})
+
+it('never enables call recording', async () => {
+  const d = deps()
+  await d.handler({ leadId: 'l1', to: '+923001234567' })
+  expect(d.created[0].record).toBeUndefined()
+})
+
+it('points Twilio at the twiml route with the call id', async () => {
+  const d = deps()
+  await d.handler({ leadId: 'l1', to: '+923001234567' })
+  expect(d.created[0].url).toBe('https://abc.ngrok.app/twiml?callId=call-1')
+})
+
+it('returns 502 when Twilio rejects the call', async () => {
+  const d = deps({ placeCall: async () => { throw new Error('twilio down') } })
+  expect((await d.handler({ leadId: 'l1', to: '+923001234567' })).status).toBe(502)
+})
+
+it('parses a stats path to its call id', () => {
+  expect(parseStatsPath('/calls/abc-123/stats')).toBe('abc-123')
+})
+
+it('ignores paths that are not stats requests', () => {
+  expect(parseStatsPath('/calls')).toBeNull()
+  expect(parseStatsPath('/calls/abc-123')).toBeNull()
+  expect(parseStatsPath('/calls/abc/123/stats')).toBeNull()
+  expect(parseStatsPath('/status')).toBeNull()
+})
+
+it('exposes frame-derived counters without persisting them', () => {
+  const result: CallResult = {
+    disposition: 'failed',
+    audio: { agentMs: 4000, prospectMs: 6000, talkRatio: 0.4, agentInterruptions: 2 },
+    voicemailDropped: false,
+    amdVerdict: 'human',
+  }
+  expect(statsPayload(result)).toEqual({
+    agentMs: 4000, prospectMs: 6000, talkRatio: 0.4, agentInterruptions: 2,
+    disposition: 'failed', voicemailDropped: false, amdVerdict: 'human',
+  })
+})
+
+it('reports zeroed counters before anyone has spoken', () => {
+  const result: CallResult = {
+    disposition: 'failed',
+    audio: { agentMs: 0, prospectMs: 0, talkRatio: 0, agentInterruptions: 0 },
+    voicemailDropped: false,
+    amdVerdict: null,
+  }
+  expect(statsPayload(result)).toMatchObject({ agentMs: 0, prospectMs: 0, talkRatio: 0 })
+})
