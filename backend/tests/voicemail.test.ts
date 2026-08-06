@@ -1,6 +1,7 @@
 import { CallSession, type Transport } from '../src/call/session.js'
 import type { RealtimeClient, RealtimeEvent } from '../src/agent/realtime.js'
 import type { Db } from '../src/lib/db.js'
+import { encodePcm16ToUlaw, SPEECH_FRAMES_TO_ABORT } from '../src/media/ulaw.js'
 
 function harness(voicemailFrames = ['VM1', 'VM2', 'VM3']) {
   const sent: string[] = []
@@ -33,12 +34,23 @@ function harness(voicemailFrames = ['VM1', 'VM2', 'VM3']) {
     start: { streamSid: 'MZ1', callSid: 'CA1', customParameters: { callId: 'c1' } },
   }))
 
-  const media = () => onMsg(JSON.stringify({
-    event: 'media', streamSid: 'MZ1', media: { track: 'inbound', payload: 'AAAA' },
+  // A full frame of μ-law silence, and one of loud tone. Energy, not mere
+  // arrival, is what decides whether a human is on the line.
+  const SILENT = encodePcm16ToUlaw(new Int16Array(160)).toString('base64')
+  const loudSamples = new Int16Array(160)
+  for (let i = 0; i < loudSamples.length; i++) loudSamples[i] = i % 2 === 0 ? 8000 : -8000
+  const LOUD = encodePcm16ToUlaw(loudSamples).toString('base64')
+
+  const frame = (payload: string) => onMsg(JSON.stringify({
+    event: 'media', streamSid: 'MZ1', media: { track: 'inbound', payload },
   }))
+  /** Twilio's continuous silence: what an answered-but-quiet line actually sends. */
+  const silence = (n = SPEECH_FRAMES_TO_ABORT * 3) => { for (let i = 0; i < n; i++) frame(SILENT) }
+  /** Sustained speech, enough to trip the abort threshold. */
+  const speak = (n = SPEECH_FRAMES_TO_ABORT) => { for (let i = 0; i < n; i++) frame(LOUD) }
   const mark = (name: string) => onMsg(JSON.stringify({ event: 'mark', mark: { name } }))
 
-  return { session, sent, rtCalls, emit, media, mark }
+  return { session, sent, rtCalls, emit, frame, silence, speak, mark, SILENT, LOUD }
 }
 
 const events = (sent: string[]) => sent.map((s) => JSON.parse(s).event)
@@ -92,14 +104,40 @@ it('sets disposition voicemail once playback completes', () => {
 it('stops forwarding audio to the model during voicemail mode', () => {
   const h = harness()
   h.session.applyAmdVerdict('machine_start')
-  h.media()
-  expect(h.rtCalls).not.toContain('audio:AAAA')
+  h.speak()
+  expect(h.rtCalls.some((c) => c.startsWith('audio:'))).toBe(false)
 })
 
-it('aborts the drop when the prospect speaks during playback — AMD false positive', () => {
+// The defect this replaced: aborting on any inbound frame. Twilio streams silence
+// continuously, so that aborted every drop about 20 ms in and the feature was dead.
+it('does not abort on continuous silence, which Twilio always sends', () => {
   const h = harness()
   h.session.applyAmdVerdict('machine_start')
-  h.media()
+  h.silence()
+  expect(h.session.result().voicemailDropped).toBe(true)
+  expect(h.session.result().amdVerdict).toBe('machine_start')
+})
+
+it('does not abort on a brief noise burst below the sustained threshold', () => {
+  const h = harness()
+  h.session.applyAmdVerdict('machine_start')
+  h.speak(SPEECH_FRAMES_TO_ABORT - 1)
+  expect(h.session.result().voicemailDropped).toBe(true)
+})
+
+it('resets the run when speech is interrupted by silence', () => {
+  const h = harness()
+  h.session.applyAmdVerdict('machine_start')
+  h.speak(SPEECH_FRAMES_TO_ABORT - 1)
+  h.silence(1)
+  h.speak(SPEECH_FRAMES_TO_ABORT - 1)
+  expect(h.session.result().voicemailDropped).toBe(true)
+})
+
+it('aborts the drop on sustained speech during playback — AMD false positive', () => {
+  const h = harness()
+  h.session.applyAmdVerdict('machine_start')
+  h.speak()
   expect(h.session.result().voicemailDropped).toBe(false)
   expect(h.session.result().disposition).not.toBe('voicemail')
 })
@@ -107,16 +145,24 @@ it('aborts the drop when the prospect speaks during playback — AMD false posit
 it('resumes forwarding audio to the model after an aborted drop', () => {
   const h = harness()
   h.session.applyAmdVerdict('machine_start')
-  h.media()          // triggers the abort
-  h.media()          // this one must reach the model
-  expect(h.rtCalls).toContain('audio:AAAA')
+  h.speak()            // trips the abort
+  h.frame(h.LOUD)      // this one must reach the model
+  expect(h.rtCalls).toContain(`audio:${h.LOUD}`)
 })
 
 it('keeps the verdict on record after an abort so false positives are countable', () => {
   const h = harness()
   h.session.applyAmdVerdict('machine_start')
-  h.media()
+  h.speak()
   expect(h.session.result().amdVerdict).toBe('machine_start_false_positive')
+})
+
+it('ignores a voicemail-complete mark that lands after an abort', () => {
+  const h = harness()
+  h.session.applyAmdVerdict('machine_start')
+  h.speak()                    // abort: a human is on the line
+  h.mark('voicemail-complete') // a mark already in flight
+  expect(h.session.result().disposition).not.toBe('voicemail')
 })
 
 it('ignores a verdict arriving after the call already finished', () => {

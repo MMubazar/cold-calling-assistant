@@ -1,5 +1,6 @@
 import { parseTwilioMessage, mediaMessage, clearMessage, markMessage } from '../media/twilio-frames.js'
 import { AudioAccounting, type AudioSnapshot, ULAW_FRAME_BYTES } from '../media/audio.js'
+import { frameEnergy, SPEECH_ENERGY_THRESHOLD, SPEECH_FRAMES_TO_ABORT } from '../media/ulaw.js'
 import { handleToolCall } from '../agent/tool-handlers.js'
 import type { RealtimeClient, RealtimeEvent } from '../agent/realtime.js'
 import type { Db, Slot } from '../lib/db.js'
@@ -48,6 +49,8 @@ export class CallSession {
   private voicemailDropped = false
   private amdVerdict: string | null = null
   private mode: 'conversation' | 'voicemail' = 'conversation'
+  /** Consecutive above-threshold inbound frames while playing a voicemail. */
+  private loudFrames = 0
 
   constructor(opts: CallSessionOptions) {
     this.opts = opts
@@ -69,13 +72,26 @@ export class CallSession {
         if (!this.started) return
         this.audio.noteInboundFrame()
         if (this.mode === 'voicemail') {
-          this.abortVoicemailDrop()
+          // Twilio streams inbound audio continuously whether or not anyone is
+          // speaking, and the model session (our usual VAD) is closed during a
+          // drop. Sustained energy, not mere frame arrival, is the only signal
+          // left that a human is actually on the line.
+          if (frameEnergy(msg.payload) >= SPEECH_ENERGY_THRESHOLD) {
+            this.loudFrames += 1
+            if (this.loudFrames >= SPEECH_FRAMES_TO_ABORT) this.abortVoicemailDrop()
+          } else {
+            this.loudFrames = 0 // a gap resets it; only sustained sound counts
+          }
           return
         }
         this.opts.realtime.sendAudio(msg.payload)
         return
       case 'mark':
-        if (msg.name === 'voicemail-complete') this.end('voicemail')
+        // Guard on the mode: a mark already in flight when an abort fires would
+        // otherwise hang up on the human the abort just decided to keep.
+        if (msg.name === 'voicemail-complete' && this.mode === 'voicemail') {
+          this.end('voicemail')
+        }
         return
       case 'stop':
         this.finish()
@@ -165,6 +181,7 @@ export class CallSession {
     if (!verdict.startsWith('machine')) return
 
     this.mode = 'voicemail'
+    this.loudFrames = 0
     this.opts.realtime.close()
 
     if (this.agentSpeaking) {

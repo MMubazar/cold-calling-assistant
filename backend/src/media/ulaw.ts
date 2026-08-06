@@ -39,6 +39,41 @@ export function chunkUlawToFrames(buf: Buffer): string[] {
   return frames
 }
 
+/** Decode one μ-law byte back to a 16-bit sample. Inverse of the encoder above. */
+export function decodeUlawByte(byte: number): number {
+  const u = ~byte & 0xff
+  const sign = u & 0x80
+  const exponent = (u >> 4) & 0x07
+  const mantissa = u & 0x0f
+  const sample = (((mantissa << 3) + BIAS) << exponent) - BIAS
+  return sign ? -sample : sample
+}
+
+/**
+ * Mean absolute amplitude of one base64 μ-law frame, 0–32635.
+ *
+ * This exists because Twilio streams inbound audio continuously whether or not
+ * anyone is speaking (see media/audio.ts). During a voicemail drop the model
+ * session is closed, so there is no VAD to consult — "a frame arrived" cannot
+ * stand in for "a human spoke", and energy is the only signal left.
+ */
+export function frameEnergy(payloadB64: string): number {
+  const buf = Buffer.from(payloadB64, 'base64')
+  if (buf.length === 0) return 0
+  let total = 0
+  for (const byte of buf) total += Math.abs(decodeUlawByte(byte))
+  return total / buf.length
+}
+
+/**
+ * Mean amplitude above which a frame counts as sound rather than line noise.
+ * Tune against real calls; the runbook says how.
+ */
+export const SPEECH_ENERGY_THRESHOLD = 500
+
+/** Consecutive loud frames required before believing a human is there: 200 ms. */
+export const SPEECH_FRAMES_TO_ABORT = 10
+
 export async function loadVoicemailFrames(path: string): Promise<string[]> {
   try {
     return chunkUlawToFrames(await readFile(path))
