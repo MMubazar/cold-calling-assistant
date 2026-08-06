@@ -51,7 +51,10 @@ export function normalizeRealtimeEvent(raw: string): RealtimeEvent | null {
     return null
   }
 
-  switch (msg?.type) {
+  // Ignore non-object payloads and events with non-string types
+  if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') return null
+
+  switch (msg.type) {
     case 'response.audio.delta':
       return typeof msg.delta === 'string' ? { kind: 'audio', payload: msg.delta } : null
     case 'input_audio_buffer.speech_started':
@@ -59,6 +62,12 @@ export function normalizeRealtimeEvent(raw: string): RealtimeEvent | null {
     case 'input_audio_buffer.speech_stopped':
       return { kind: 'prospect_speech_stopped' }
     case 'response.function_call_arguments.done': {
+      // A tool call with no id or name cannot be answered: the id is the address
+      // a result is returned to. Drop it rather than emit an event whose declared
+      // string fields are actually undefined — Task 9 echoes toolCallId straight
+      // back to the model, so an undefined there strands the call silently.
+      if (typeof msg.call_id !== 'string' || typeof msg.name !== 'string') return null
+
       let args: Record<string, unknown> = {}
       try {
         const parsed = JSON.parse(msg.arguments ?? '{}')

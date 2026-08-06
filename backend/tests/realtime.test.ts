@@ -74,3 +74,41 @@ it('ignores unknown and malformed events', () => {
   expect(normalizeRealtimeEvent(JSON.stringify({ type: 'rate_limits.updated' }))).toBeNull()
   expect(normalizeRealtimeEvent('nonsense')).toBeNull()
 })
+
+// This function is the boundary that keeps a malformed model event from killing
+// a live call. Every hostile shape below is asserted, not merely reasoned about.
+
+it('drops a tool call with no call_id — a result would have nowhere to go', () => {
+  expect(normalizeRealtimeEvent(JSON.stringify({
+    type: 'response.function_call_arguments.done', name: 'end_call', arguments: '{}',
+  }))).toBeNull()
+})
+
+it('drops a tool call with no name', () => {
+  expect(normalizeRealtimeEvent(JSON.stringify({
+    type: 'response.function_call_arguments.done', call_id: 'fc1', arguments: '{}',
+  }))).toBeNull()
+})
+
+it('treats absent tool arguments as empty rather than dropping the call', () => {
+  expect(normalizeRealtimeEvent(JSON.stringify({
+    type: 'response.function_call_arguments.done', call_id: 'fc1', name: 'end_call',
+  }))).toEqual({ kind: 'tool_call', toolCallId: 'fc1', name: 'end_call', args: {} })
+})
+
+it('ignores an audio delta whose payload is not a string', () => {
+  expect(normalizeRealtimeEvent(JSON.stringify({ type: 'response.audio.delta', delta: 42 })))
+    .toBeNull()
+})
+
+it('ignores JSON that parses to something other than an object', () => {
+  expect(normalizeRealtimeEvent('null')).toBeNull()
+  expect(normalizeRealtimeEvent('42')).toBeNull()
+  expect(normalizeRealtimeEvent('[1,2]')).toBeNull()
+  expect(normalizeRealtimeEvent('"a string"')).toBeNull()
+})
+
+it('ignores an event whose type is not a string', () => {
+  expect(normalizeRealtimeEvent(JSON.stringify({ type: 7 }))).toBeNull()
+  expect(normalizeRealtimeEvent(JSON.stringify({ type: null }))).toBeNull()
+})
