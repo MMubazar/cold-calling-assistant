@@ -3140,7 +3140,9 @@ import {
   buildTwiml,
   createCallHandler,
   parseStatsPath,
+  readBody,
   socketTransport,
+  BodyTooLarge,
   statsPayload,
 } from '../src/server.js'
 import type { CallResult } from '../src/call/session.js'
@@ -3312,6 +3314,20 @@ it('replays buffered messages in arrival order on flush', () => {
   transport.onMessage((raw) => seen.push(raw))
   transport.flush()
   expect(seen).toEqual(['one', 'two'])
+})
+
+// readBody takes an async iterable so the cap is testable without a socket.
+async function* body(...chunks: string[]) {
+  for (const c of chunks) yield Buffer.from(c)
+}
+
+it('reads a body that fits under the cap', async () => {
+  expect(await readBody(body('{"a":', '1}'))).toBe('{"a":1}')
+})
+
+it('refuses a body over the cap instead of buffering it', async () => {
+  const oversized = body('x'.repeat(40 * 1024), 'y'.repeat(40 * 1024))
+  await expect(readBody(oversized)).rejects.toBeInstanceOf(BodyTooLarge)
 })
 
 it('does not let a late message overtake ones already buffered', () => {
@@ -3491,16 +3507,27 @@ const MAX_BODY_BYTES = 64 * 1024
 
 export class BodyTooLarge extends Error {}
 
-async function readBody(req: IncomingMessage): Promise<string> {
+/**
+ * Reads a request body, refusing to buffer more than the cap.
+ *
+ * Deliberately does NOT destroy the request: in HTTP/1.x the request and the
+ * response share a socket, so tearing it down here means the 413 never reaches
+ * the caller — they see a hang-up instead of a status code. The dispatcher
+ * responds first and closes afterwards.
+ *
+ * Takes an async iterable rather than an IncomingMessage so the cap is testable
+ * without a socket.
+ */
+export async function readBody(source: AsyncIterable<Buffer | string>): Promise<string> {
   const chunks: Buffer[] = []
   let total = 0
-  for await (const c of req) {
-    total += (c as Buffer).length
+  for await (const c of source) {
+    const chunk = typeof c === 'string' ? Buffer.from(c) : c
+    total += chunk.length
     if (total > MAX_BODY_BYTES) {
-      req.destroy()
       throw new BodyTooLarge(`body exceeded ${MAX_BODY_BYTES} bytes`)
     }
-    chunks.push(c as Buffer)
+    chunks.push(chunk)
   }
   return Buffer.concat(chunks).toString()
 }
@@ -3585,7 +3612,12 @@ export async function startServer(env: Env): Promise<void> {
     } catch (err) {
       if (err instanceof BodyTooLarge) {
         console.warn(`[http] rejected oversized body on ${url.pathname}`)
-        return json(res, 413, { error: 'request body too large' })
+        // Respond BEFORE abandoning the request. The two share a socket, so
+        // destroying the request first would replace the 413 with a hang-up.
+        res.writeHead(413, { 'content-type': 'application/json', connection: 'close' })
+        res.end(JSON.stringify({ error: 'request body too large' }))
+        req.destroy()
+        return
       }
       console.error('[http] handler failed', err)
       return json(res, 500, { error: 'internal error' })
@@ -3684,9 +3716,9 @@ if (process.argv[1]?.endsWith('server.ts')) {
 - [ ] **Step 7: Run the full suite to verify everything passes**
 
 Run: `cd backend && TEST_DATABASE_URL=postgres://sb@127.0.0.1:5470/coldcall_test npm test`
-Expected: all suites green — 13 test files, 148 tests (5 env, 9 allowlist, 7 twilio-frames,
+Expected: all suites green — 13 test files, 150 tests (5 env, 9 allowlist, 7 twilio-frames,
 12 audio, 11 db, 9 playbook, 12 tool-handlers, 18 realtime, 19 session, 10 ulaw, 16 voicemail,
-2 teardown, 18 server-routes).
+2 teardown, 20 server-routes).
 
 - [ ] **Step 8: Typecheck**
 
