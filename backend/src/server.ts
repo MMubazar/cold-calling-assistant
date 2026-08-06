@@ -82,7 +82,12 @@ export function createCallHandler(deps: CallHandlerDeps) {
         statusCallbackEvent: ['completed'],
         // Async so the media stream opens immediately; sync detection would add 2-4 s to
         // every human-answered call (spec §7).
-        machineDetection: 'Enable',
+        // DetectMessageEnd, not Enable: 'Enable' reports machine_start when the
+        // greeting BEGINS, so we would talk over it and the voicemail drop's
+        // energy gate would see the machine's own greeting and abort. Waiting for
+        // the greeting to end costs nothing on human-answered calls because the
+        // detection is async — only the verdict is delayed, never the connection.
+        machineDetection: 'DetectMessageEnd',
         asyncAmd: 'true',
         asyncAmdStatusCallback: `${base}/amd?callId=${call.id}`,
         asyncAmdStatusCallbackMethod: 'POST',
@@ -101,18 +106,64 @@ export function createCallHandler(deps: CallHandlerDeps) {
 interface Live { session: CallSession; startedAtMs: number }
 const live = new Map<string, Live>()
 
-function socketTransport(ws: WebSocket): Transport {
+/** AMD verdicts that arrived before their session finished connecting. */
+const earlyVerdicts = new Map<string, string>()
+
+export interface BufferingTransport extends Transport {
+  /** Deliver everything received so far, in order, then stream live. */
+  flush(): void
+}
+
+/**
+ * Buffers from the moment the socket opens.
+ *
+ * Twilio starts streaming audio immediately, but building a session needs three
+ * database round trips and a realtime handshake. Without buffering there is no
+ * listener attached during that window and the frames are simply lost — `ws`
+ * queues nothing — costing the prospect's first second or two of speech on every
+ * single call.
+ */
+export function socketTransport(ws: WebSocket): BufferingTransport {
+  const queued: string[] = []
+  let handler: ((raw: string) => void) | null = null
+  let flushed = false
+
+  ws.on('message', (d) => {
+    const raw = d.toString()
+    // Keep queueing until flush, so a message arriving between session
+    // construction and flush cannot overtake the ones already waiting.
+    if (flushed && handler) handler(raw)
+    else queued.push(raw)
+  })
+
   return {
     send: (raw) => { if (ws.readyState === ws.OPEN) ws.send(raw) },
     close: () => ws.close(),
-    onMessage: (cb) => ws.on('message', (d) => cb(d.toString())),
+    onMessage: (cb) => { handler = cb },
     onClose: (cb) => ws.on('close', cb),
+    flush: () => {
+      flushed = true
+      for (const raw of queued.splice(0)) handler?.(raw)
+    },
   }
 }
 
+/** 64 KiB. These routes are reachable through a public tunnel. */
+const MAX_BODY_BYTES = 64 * 1024
+
+export class BodyTooLarge extends Error {}
+
 async function readBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = []
-  for await (const c of req) chunks.push(c as Buffer)
+  let total = 0
+  for await (const c of req) {
+    total += (c as Buffer).length
+    if (total > MAX_BODY_BYTES) {
+      req.destroy()
+      throw new BodyTooLarge(`body exceeded ${MAX_BODY_BYTES} bytes`)
+    }
+    chunks.push(c as Buffer)
+  }
   return Buffer.concat(chunks).toString()
 }
 
@@ -155,17 +206,30 @@ export async function startServer(env: Env): Promise<void> {
       if (req.method === 'POST' && url.pathname === '/amd') {
         const verdict = parseForm(await readBody(req)).AnsweredBy ?? 'unknown'
         console.log(`[amd] call=${callId} verdict=${verdict}`)
-        live.get(callId)?.session.applyAmdVerdict(verdict)
+        const entry = live.get(callId)
+        if (entry) {
+          entry.session.applyAmdVerdict(verdict)
+        } else {
+          // AMD detection and the media handshake are independent races off the
+          // same answer event. A verdict that wins is held for the session to
+          // collect, not discarded — dropping it would treat a machine as human
+          // and silently defeat the voicemail drop.
+          console.warn(`[amd] call=${callId} verdict arrived before the session; holding it`)
+          earlyVerdicts.set(callId, verdict)
+        }
         return json(res, 200, { ok: true })
       }
 
       if (req.method === 'POST' && url.pathname === '/status') {
         await readBody(req)
+        // Delete before awaiting: the socket close and this callback are both
+        // triggered by the call ending, so whichever arrives second must find
+        // nothing left to persist. Map.delete returning true is the claim.
         const entry = live.get(callId)
-        if (entry) {
+        if (entry && live.delete(callId)) {
           await persistCallResult(db, callId, entry.session.result(), entry.startedAtMs)
-          live.delete(callId)
         }
+        earlyVerdicts.delete(callId)
         return json(res, 200, { ok: true })
       }
 
@@ -181,6 +245,10 @@ export async function startServer(env: Env): Promise<void> {
 
       return json(res, 404, { error: 'not found' })
     } catch (err) {
+      if (err instanceof BodyTooLarge) {
+        console.warn(`[http] rejected oversized body on ${url.pathname}`)
+        return json(res, 413, { error: 'request body too large' })
+      }
       console.error('[http] handler failed', err)
       return json(res, 500, { error: 'internal error' })
     }
@@ -189,12 +257,19 @@ export async function startServer(env: Env): Promise<void> {
   const wss = new WebSocketServer({ server, path: '/media' })
 
   wss.on('connection', (ws) => {
-    // The callId arrives in the start event's customParameters, so hold the socket
-    // until then before building the session.
-    const onFirst = async (data: unknown) => {
+    // Buffering starts the instant the socket opens, before any await, so nothing
+    // Twilio sends during setup is lost.
+    const transport = socketTransport(ws)
+    let starting = false
+
+    // A second listener that only observes. The callId arrives in the start
+    // event's customParameters and is needed before a session can be built.
+    const detectStart = async (data: unknown) => {
+      if (starting) return
       const msg = parseTwilioMessage(String(data))
       if (msg?.event !== 'start') return
-      ws.off('message', onFirst)
+      starting = true
+      ws.off('message', detectStart)
 
       const callId = msg.customParameters.callId ?? ''
       const startedAtMs = Date.now()
@@ -218,26 +293,39 @@ export async function startServer(env: Env): Promise<void> {
         })
 
         const session = new CallSession({
-          transport: socketTransport(ws), realtime, db, callId, leadId: lead.id, slots, voicemailFrames,
+          transport, realtime, db, callId, leadId: lead.id, slots, voicemailFrames,
         })
         live.set(callId, { session, startedAtMs })
 
         session.onFinished(() => {
-          void persistCallResult(db, callId, session.result(), startedAtMs)
-            .then(() => live.delete(callId))
+          // Claim the entry first; /status may be racing us for the same call.
+          if (live.delete(callId)) {
+            void persistCallResult(db, callId, session.result(), startedAtMs)
+          }
+          earlyVerdicts.delete(callId)
         })
 
-        // Replay the start event the session did not see while we were setting up.
-        session.handleTwilioMessage(String(data))
+        // Releases the start event and every frame buffered since, in order.
+        transport.flush()
+
+        // A verdict that beat the handshake was held rather than dropped.
+        const held = earlyVerdicts.get(callId)
+        if (held !== undefined) {
+          earlyVerdicts.delete(callId)
+          console.log(`[amd] call=${callId} applying held verdict=${held}`)
+          session.applyAmdVerdict(held)
+        }
+
         realtime.requestResponse()
         console.log(`[media] session live call=${callId} lead=${lead.name}`)
       } catch (err) {
         console.error('[media] failed to start session', err)
+        earlyVerdicts.delete(callId)
         ws.close()
       }
     }
 
-    ws.on('message', onFirst)
+    ws.on('message', detectStart)
   })
 
   server.listen(env.port, () => {

@@ -1,4 +1,10 @@
-import { buildTwiml, createCallHandler, parseStatsPath, statsPayload } from '../src/server.js'
+import {
+  buildTwiml,
+  createCallHandler,
+  parseStatsPath,
+  socketTransport,
+  statsPayload,
+} from '../src/server.js'
 import type { CallResult } from '../src/call/session.js'
 import type { Db } from '../src/lib/db.js'
 
@@ -72,7 +78,7 @@ it('falls back to the lead phone when no destination is supplied', async () => {
 it('requests async machine detection so connection is never delayed', async () => {
   const d = deps()
   await d.handler({ leadId: 'l1', to: '+923001234567' })
-  expect(d.created[0].machineDetection).toBe('Enable')
+  expect(d.created[0].machineDetection).toBe('DetectMessageEnd')
   expect(String(d.created[0].asyncAmd)).toBe('true')
   expect(d.created[0].asyncAmdStatusCallback).toContain('/amd')
 })
@@ -126,4 +132,57 @@ it('reports zeroed counters before anyone has spoken', () => {
     amdVerdict: null,
   }
   expect(statsPayload(result)).toMatchObject({ agentMs: 0, prospectMs: 0, talkRatio: 0 })
+})
+
+// The buffering transport is what stops Twilio's first second of audio being
+// dropped while the session is still connecting. It is testable without a socket.
+
+function fakeWs() {
+  const sent: string[] = []
+  const listeners: Record<string, ((d: unknown) => void)[]> = {}
+  const ws = {
+    OPEN: 1,
+    readyState: 1,
+    send: (raw: string) => { sent.push(raw) },
+    close: () => {},
+    on: (event: string, cb: (d: unknown) => void) => { (listeners[event] ??= []).push(cb) },
+    off: () => {},
+  }
+  return {
+    ws: ws as unknown as Parameters<typeof socketTransport>[0],
+    sent,
+    deliver: (raw: string) => (listeners.message ?? []).forEach((cb) => cb(raw)),
+  }
+}
+
+it('holds messages that arrive before a handler is attached', () => {
+  const f = fakeWs()
+  const transport = socketTransport(f.ws)
+  f.deliver('one')
+  f.deliver('two')
+  const seen: string[] = []
+  transport.onMessage((raw) => seen.push(raw))
+  expect(seen).toEqual([]) // still buffered — flush has not run
+})
+
+it('replays buffered messages in arrival order on flush', () => {
+  const f = fakeWs()
+  const transport = socketTransport(f.ws)
+  f.deliver('one')
+  f.deliver('two')
+  const seen: string[] = []
+  transport.onMessage((raw) => seen.push(raw))
+  transport.flush()
+  expect(seen).toEqual(['one', 'two'])
+})
+
+it('does not let a late message overtake ones already buffered', () => {
+  const f = fakeWs()
+  const transport = socketTransport(f.ws)
+  f.deliver('first')
+  const seen: string[] = []
+  transport.onMessage((raw) => seen.push(raw))
+  f.deliver('second') // arrives after the handler but before flush
+  transport.flush()
+  expect(seen).toEqual(['first', 'second'])
 })
