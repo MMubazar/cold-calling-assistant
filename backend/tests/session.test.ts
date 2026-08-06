@@ -31,12 +31,16 @@ function fakeRealtime() {
   return { client, calls, emit: (e: RealtimeEvent) => handler(e) }
 }
 
+// Parameters are annotated because the `as unknown as Db` cast happens after the
+// literal is built, so nothing contextually types these callbacks. Without the
+// annotations `noImplicitAny` fails the typecheck.
 function fakeDb(): Db {
   return {
     insertTranscriptTurn: async () => {},
     getMeetingByCall: async () => null,
     takeSlot: async () => true,
-    insertMeeting: async (_c, _l, s) => ({ id: 'm1', slotId: s.id, startsAt: s.startsAt }),
+    insertMeeting: async (_c: string, _l: string, s: Slot) =>
+      ({ id: 'm1', slotId: s.id, startsAt: s.startsAt }),
     upsertQualification: async () => {},
   } as unknown as Db
 }
@@ -158,7 +162,11 @@ it('stores transcript turns for both sides', async () => {
   const session = new CallSession({
     transport: t.transport, realtime: r.client, callId: 'c', leadId: 'l', slots: SLOTS,
     voicemailFrames: [],
-    db: { insertTranscriptTurn: async (_c, role, text) => { stored.push([role, text]) } } as unknown as Db,
+    db: {
+      insertTranscriptTurn: async (_c: string, role: 'agent' | 'prospect', text: string) => {
+        stored.push([role, text])
+      },
+    } as unknown as Db,
   })
   t.inject(startMessage())
   r.emit({ kind: 'transcript', role: 'agent', text: 'Hi, this is Sara' })

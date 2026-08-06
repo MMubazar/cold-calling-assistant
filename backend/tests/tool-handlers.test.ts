@@ -4,11 +4,15 @@ import type { Db, Slot } from '../src/lib/db.js'
 
 const SLOTS: Slot[] = [{ id: 's1', startsAt: new Date('2026-08-10T09:00:00Z') }]
 
+// Parameters are annotated because the `as unknown as Db` cast happens after the
+// literal is built, so nothing contextually types these callbacks. Without the
+// annotations `noImplicitAny` fails the typecheck.
 function fakeDb(overrides: Partial<Db> = {}): Db {
   return {
     getMeetingByCall: async () => null,
     takeSlot: async () => true,
-    insertMeeting: async (_c, _l, slot) => ({ id: 'm1', slotId: slot.id, startsAt: slot.startsAt }),
+    insertMeeting: async (_c: string, _l: string, slot: Slot) =>
+      ({ id: 'm1', slotId: slot.id, startsAt: slot.startsAt }),
     upsertQualification: async () => {},
     ...overrides,
   } as unknown as Db
