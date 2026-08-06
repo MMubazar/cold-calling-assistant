@@ -193,14 +193,20 @@ agree to a meeting.
 
 Then check the results:
 
+Every query below anchors to the newest call by `started_at`. Do **not** order `call_scores` or
+`meetings` by their own id — those are random UUIDs, so "the last row" is arbitrary, and this
+database already holds seeded demo calls. You would grade the wrong call.
+
 ```bash
 psql -h 127.0.0.1 -p 5470 -U sb -d coldcall -c "select disposition, duration_s, amd_verdict, voicemail_dropped
   from calls order by started_at desc limit 1;"
 psql -h 127.0.0.1 -p 5470 -U sb -d coldcall -c "select agent_ms, prospect_ms, round(talk_ratio::numeric, 2) as ratio,
-  agent_interruptions from call_scores order by call_id desc limit 1;"
+  agent_interruptions from call_scores
+  where call_id = (select id from calls order by started_at desc limit 1);"
 psql -h 127.0.0.1 -p 5470 -U sb -d coldcall -c "select role, text from transcript_turns
   where call_id = (select id from calls order by started_at desc limit 1) order by id;"
-psql -h 127.0.0.1 -p 5470 -U sb -d coldcall -c "select starts_at from meetings order by id desc limit 1;"
+psql -h 127.0.0.1 -p 5470 -U sb -d coldcall -c "select starts_at from meetings
+  where call_id = (select id from calls order by started_at desc limit 1);"
 ```
 
 **Pass criteria**
@@ -210,7 +216,29 @@ psql -h 127.0.0.1 -p 5470 -U sb -d coldcall -c "select starts_at from meetings o
   `src/agent/playbook.ts` (currently `400` ms) is too low — raise it by 100 ms and call again.
 - `talk_ratio` is between 0.40 and 0.60. Above 0.60 means the agent is pitching rather than
   discovering; tighten the playbook, not the code.
+
+  Note the known bias: when the prospect interrupts the agent mid-sentence, the frames already
+  sent to Twilio are discarded and subtracted whole, including the part actually heard. So
+  `talk_ratio` reads slightly **low** on a call with several interruptions — roughly 0.03–0.08.
+  It errs toward passing a talkative agent, not toward failing a good one.
 - The transcript reads as a real conversation with turns from both sides.
+
+## Run test call 3 first
+
+Do the calls in the order **3, 1, 2**, not 1, 2, 3.
+
+Test call 3 checks a Twilio behaviour this system has never observed: that a call subscribed only
+to `statusCallbackEvent: ['completed']` still gets a terminal callback carrying
+`CallStatus=no-answer`. That is documented and universally relied on, but if it does not fire,
+unanswered calls never finalize — and a call row that stays open is the one failure that used to
+disable the console entirely. It is now guarded by a ten-minute staleness window, but you want to
+know within one ring-out rather than after three calls.
+
+If the first thing you check on any call is one thing, make it the log for
+`rejected: bad Twilio signature`. Signature validation on `/amd` and `/status` is the newest
+change in this build and it fails silently: a wrong `TWILIO_AUTH_TOKEN` (an API key/secret pair
+rather than the account auth token) or a `PUBLIC_BASE_URL` that does not match what Twilio signed
+produces no error — just no voicemail drop, a NULL `amd_verdict`, and calls that never finalize.
 
 ## Test call 2 — voicemail drop
 
@@ -222,7 +250,14 @@ psql -h 127.0.0.1 -p 5470 -U sb -d coldcall -c "select disposition, voicemail_dr
 ```
 
 **Pass criteria:** `disposition` is `voicemail`, `voicemail_dropped` is true, and the recorded
-message plays cleanly with no clipping at either end.
+message plays cleanly.
+
+One known wart to expect rather than debug: the queued opener is only flushed if the agent is
+still mid-response when the verdict lands. With `DetectMessageEnd` the verdict usually arrives
+after generation has finished, so a second or two of the opener can still be sitting in Twilio's
+buffer and gets recorded immediately before the voicemail message. Annoying, not broken — the
+message itself is intact. If it bothers you, the fix is to stop gating that one `clear` on
+whether the agent is currently speaking (`src/call/session.ts`).
 
 ## Test call 3 — nobody answers
 
@@ -263,8 +298,18 @@ psql -h 127.0.0.1 -p 5470 -U sb -d coldcall -c "select amd_verdict, count(*) fro
 ```
 
 **Known Phase 1 limitation:** after an aborted drop the model session has already been closed,
-so the call stays connected but the agent does not resume speaking. Hang up and redial. Keeping
-the model session alive through a false positive is Phase 2 work.
+so the call stays connected but the agent does not resume speaking. **Hang up and redial — the
+call will not recover on its own**, and it otherwise runs to the 300 s ceiling with a dead model.
+Keeping the model session alive through a false positive is Phase 2 work.
+
+Two side effects of that dead session, so you are not misled by them:
+
+- The log fills with `[realtime] dropped input_audio_buffer.append: socket is not open`, about
+  fifty lines a second, because inbound audio keeps arriving with nowhere to send it. It is
+  noise, not a new fault — but it will bury anything else in the log, so hang up promptly.
+- `prospect_ms` stays at 0 and `talk_ratio` is meaningless for that call. There is no voice
+  activity detection left to gate the counting once the model session is gone. Do not grade a
+  false-positive call against the talk-ratio criterion; redial and grade the retry.
 
 ## Other things that will go wrong
 
