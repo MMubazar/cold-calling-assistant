@@ -1,0 +1,833 @@
+/* =============================================================
+   Cold Line — operator console
+   A monitoring surface for a machine that is talking to a person
+   right now. Instrument panel, not CRM: deep ink ground, two-party
+   colour coding (amber = the agent's voice, teal = the prospect's)
+   carried consistently through band, tape and chips, and every
+   numeric set in a terminal-lineage mono.
+   ============================================================= */
+
+:root {
+  --ground: #0e1721;
+  --ground-deep: #0a1017;
+  --raised: #16232f;
+  --raised-hi: #1c2c3a;
+  --rule: #24384a;
+  --rule-soft: #1b2a37;
+
+  --ink: #e6edf3;
+  --ink-dim: #8ca3b8;
+  --ink-faint: #5b7387;
+
+  /* The two voices. Used for data, never for decoration. */
+  --agent: #f5a524;
+  --agent-soft: rgba(245, 165, 36, 0.14);
+  --prospect: #4fd1c5;
+  --prospect-soft: rgba(79, 209, 197, 0.14);
+
+  --alert: #ff5c5c;
+  --alert-soft: rgba(255, 92, 92, 0.14);
+  --good: #63d68a;
+
+  --radius: 3px;
+  --gap: 20px;
+
+  --shell: 1440px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-body), system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+input {
+  font: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--prospect);
+  outline-offset: 2px;
+}
+
+/* ---------- shared type utilities ---------- */
+
+.mono {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Eyebrow labels. Mono, wide-tracked, small — the panel-label voice. */
+.eyebrow {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+/* ---------- shell ---------- */
+
+.shell {
+  max-width: var(--shell);
+  margin: 0 auto;
+  padding: 0 24px 64px;
+}
+
+/* ---------- masthead ---------- */
+
+.masthead {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 20px 0 18px;
+  border-bottom: 1px solid var(--rule);
+  margin-bottom: var(--gap);
+}
+
+.masthead-mark {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.32em;
+  text-transform: uppercase;
+  color: var(--ink);
+}
+
+.masthead-rule {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, var(--rule), transparent);
+}
+
+.masthead-meta {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+.masthead-field {
+  display: flex;
+  gap: 7px;
+  align-items: baseline;
+}
+
+.masthead-field span:last-child {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--ink-dim);
+}
+
+/* ---------- layout ---------- */
+
+.deck {
+  display: grid;
+  grid-template-columns: minmax(300px, 380px) 1fr;
+  gap: var(--gap);
+  align-items: start;
+}
+
+.panel {
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.panel-count {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+/* ---------- leads ---------- */
+
+.lead-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.lead {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--rule-soft);
+}
+
+.lead:last-child {
+  border-bottom: 0;
+}
+
+.lead-name {
+  font-weight: 600;
+  letter-spacing: -0.011em;
+}
+
+.lead-org {
+  color: var(--ink-dim);
+  font-weight: 400;
+}
+
+.lead-phone {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--ink-faint);
+  margin-top: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The dial control. Squared, mono, deliberately switch-like. */
+.dial {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 8px 15px;
+  background: transparent;
+  color: var(--prospect);
+  border: 1px solid var(--prospect);
+  border-radius: var(--radius);
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.dial:hover:not(:disabled) {
+  background: var(--prospect);
+  color: var(--ground-deep);
+}
+
+.dial:disabled {
+  color: var(--ink-faint);
+  border-color: var(--rule);
+  cursor: not-allowed;
+}
+
+/* ---------- add lead ---------- */
+
+.add-lead {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border-top: 1px solid var(--rule);
+}
+
+.add-lead-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.field {
+  background: var(--ground-deep);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  color: var(--ink);
+  font-size: 13px;
+  min-width: 0;
+}
+
+.field::placeholder {
+  color: var(--ink-faint);
+}
+
+.field-phone {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  grid-column: 1 / -1;
+}
+
+.add-lead-submit {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 9px 12px;
+  background: var(--raised-hi);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  color: var(--ink-dim);
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+.add-lead-submit:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--ink-faint);
+}
+
+.add-lead-submit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ---------- live panel ---------- */
+
+.live {
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  min-height: 520px;
+  display: flex;
+  flex-direction: column;
+}
+
+.live-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 18px 20px 16px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.live-who {
+  display: grid;
+  gap: 4px;
+}
+
+.live-who-name {
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.live-who-meta {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+/* Duration readout — the largest number on the page. */
+.clock {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 40px;
+  line-height: 1;
+  font-weight: 500;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.clock-idle {
+  color: var(--ink-faint);
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  justify-content: flex-end;
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+.status-ready {
+  color: var(--ink-faint);
+}
+
+.status-ringing {
+  color: var(--agent);
+}
+
+.status-connected {
+  color: var(--good);
+}
+
+.status-voicemail {
+  color: var(--agent);
+}
+
+.status-ended {
+  color: var(--ink-dim);
+}
+
+.status-failed {
+  color: var(--alert);
+}
+
+.status-live .status-dot {
+  animation: throb 1.6s ease-in-out infinite;
+}
+
+@keyframes throb {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.8);
+  }
+}
+
+/* =============================================================
+   SIGNATURE — the talk band.
+   The one thing the operator must learn from a cold call is
+   whether the agent listened. Speaking time comes from counting
+   20 ms media frames per party, so the band IS the data model,
+   not a chart drawn over it. The bracket marks the 40–50 %
+   target; crossing 60 % turns the agent's half to alert.
+   ============================================================= */
+
+.band {
+  padding: 20px 20px 18px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.band-topline {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.band-verdict {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);
+}
+
+.band-verdict-warn {
+  color: var(--alert);
+}
+
+/* target bracket sits directly above the bar, spanning 40–50% */
+.band-gauge {
+  position: relative;
+  padding-top: 15px;
+}
+
+.band-target {
+  position: absolute;
+  top: 0;
+  left: 40%;
+  width: 10%;
+  height: 9px;
+  border: 1px solid var(--ink-faint);
+  border-bottom: 0;
+}
+
+.band-target-label {
+  position: absolute;
+  top: -3px;
+  left: calc(50% + 10px);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+
+.band-bar {
+  display: flex;
+  height: 42px;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--ground-deep);
+}
+
+.band-seg {
+  display: flex;
+  align-items: center;
+  padding: 0 11px;
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  transition: width 420ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.band-seg-agent {
+  background: var(--agent-soft);
+  color: var(--agent);
+  border-right: 1px solid var(--agent);
+  justify-content: flex-start;
+}
+
+.band-seg-agent-over {
+  background: var(--alert-soft);
+  color: var(--alert);
+  border-right-color: var(--alert);
+}
+
+.band-seg-prospect {
+  background: var(--prospect-soft);
+  color: var(--prospect);
+  justify-content: flex-end;
+}
+
+.band-empty {
+  height: 42px;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.band-legend {
+  display: flex;
+  gap: 22px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.band-stat {
+  display: grid;
+  gap: 3px;
+}
+
+.band-stat-value {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.band-stat-value-warn {
+  color: var(--alert);
+}
+
+/* ---------- transcript tape ---------- */
+
+.tape {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 20px 20px;
+  max-height: 420px;
+}
+
+.tape-head {
+  position: sticky;
+  top: 0;
+  background: var(--raised);
+  padding: 14px 0 10px;
+}
+
+.turn {
+  display: grid;
+  grid-template-columns: 78px 1fr;
+  gap: 12px;
+  padding: 7px 0 7px 11px;
+  border-left: 2px solid var(--rule);
+  animation: turn-in 260ms ease-out;
+}
+
+.turn-agent {
+  border-left-color: var(--agent);
+}
+
+.turn-prospect {
+  border-left-color: var(--prospect);
+}
+
+.turn-role {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding-top: 3px;
+}
+
+.turn-agent .turn-role {
+  color: var(--agent);
+}
+
+.turn-prospect .turn-role {
+  color: var(--prospect);
+}
+
+.turn-text {
+  color: var(--ink);
+}
+
+@keyframes turn-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---------- empty state ---------- */
+
+.vacant {
+  flex: 1;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  padding: 60px 20px;
+  text-align: center;
+}
+
+.vacant-title {
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+.vacant-hint {
+  color: var(--ink-dim);
+  max-width: 34ch;
+}
+
+/* dial-tone: two flat lines, the visual of an open line with nothing on it */
+.vacant-lines {
+  width: 148px;
+  display: grid;
+  gap: 7px;
+  margin-bottom: 6px;
+}
+
+.vacant-lines span {
+  height: 1px;
+  background: var(--rule);
+}
+
+.vacant-lines span:first-child {
+  background: linear-gradient(90deg, transparent, var(--agent), transparent);
+  opacity: 0.5;
+}
+
+.vacant-lines span:last-child {
+  background: linear-gradient(90deg, transparent, var(--prospect), transparent);
+  opacity: 0.5;
+}
+
+/* ---------- notice ---------- */
+
+.notice {
+  margin: 0 20px 16px;
+  padding: 11px 13px;
+  border: 1px solid var(--alert);
+  border-radius: var(--radius);
+  background: var(--alert-soft);
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.notice-quiet {
+  border-color: var(--rule);
+  background: var(--ground-deep);
+  color: var(--ink-dim);
+}
+
+/* ---------- log ---------- */
+
+.log {
+  margin-top: var(--gap);
+}
+
+.log-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.log-table th {
+  text-align: left;
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  font-weight: 400;
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.log-table td {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--rule-soft);
+  vertical-align: middle;
+}
+
+.log-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.log-num {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-dim);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.log-empty {
+  padding: 34px 16px;
+  text-align: center;
+  color: var(--ink-faint);
+}
+
+/* Disposition chip — terse code, colour-coded by outcome class. */
+.chip {
+  display: inline-block;
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 4px 8px;
+  border-radius: 2px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+
+.chip-booked {
+  color: var(--good);
+}
+
+.chip-progress {
+  color: var(--prospect);
+}
+
+.chip-machine {
+  color: var(--agent);
+}
+
+.chip-dead {
+  color: var(--ink-faint);
+}
+
+.chip-failed {
+  color: var(--alert);
+}
+
+/* miniature talk ratio, in the log */
+.minibar {
+  display: flex;
+  width: 82px;
+  height: 6px;
+  border-radius: 1px;
+  overflow: hidden;
+  background: var(--ground-deep);
+}
+
+.minibar-agent {
+  background: var(--agent);
+}
+
+.minibar-agent-over {
+  background: var(--alert);
+}
+
+.minibar-prospect {
+  background: var(--prospect);
+}
+
+/* ---------- responsive ---------- */
+
+@media (max-width: 980px) {
+  .deck {
+    grid-template-columns: 1fr;
+  }
+
+  /* On a narrow screen the live call is the reason you opened this. */
+  .deck > .live {
+    order: -1;
+  }
+
+  .clock {
+    font-size: 32px;
+  }
+}
+
+@media (max-width: 560px) {
+  .shell {
+    padding: 0 14px 44px;
+  }
+
+  .masthead {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  .masthead-rule {
+    display: none;
+  }
+
+  .live-head {
+    flex-direction: column;
+  }
+
+  .clock,
+  .status {
+    text-align: left;
+    justify-content: flex-start;
+  }
+
+  .turn {
+    grid-template-columns: 1fr;
+    gap: 3px;
+  }
+
+  .log-hide-sm {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
