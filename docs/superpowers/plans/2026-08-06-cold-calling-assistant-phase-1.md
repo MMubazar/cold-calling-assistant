@@ -41,6 +41,7 @@ These are deliberate changes made after checking the local environment. Each is 
 - Twilio call recording stays **off** (spec §14).
 - No per-frame database writes. Counters accumulate in memory and are written once at call end (spec §9).
 - `book_meeting` is synchronous and idempotent per call. `save_qualification` is fire-and-forget and its failures are logged and swallowed (spec §5, §10).
+- **Every task runs `npm run typecheck` before committing, and it must be clean.** Passing tests are not sufficient: vitest transpiles without type-checking, so a type error can sit in a green suite indefinitely. Nine `noImplicitAny` errors accumulated across Tasks 7 and 9 for exactly this reason — the plan only gated typecheck at Task 11, and two tasks' worth of drift landed before anyone looked.
 - **Database-touching tests read `TEST_DATABASE_URL`, never `DATABASE_URL`, and refuse to run if it is unset or names a database whose name does not end in `_test`.** These tests truncate tables; without this guard `npm test` silently destroys whatever the application database holds. Added after Task 5's review found the hazard had already fired once.
 - Nothing is deployed, pushed, or published. Commits are local only.
 - The realtime model id is read from `OPENAI_REALTIME_MODEL`. Never hardcode it — verify the current id against provider documentation before the acceptance call (spec §6).
@@ -1424,11 +1425,15 @@ import type { Db, Slot } from '../src/lib/db.js'
 
 const SLOTS: Slot[] = [{ id: 's1', startsAt: new Date('2026-08-10T09:00:00Z') }]
 
+// Parameters are annotated because the `as unknown as Db` cast happens after the
+// literal is built, so nothing contextually types these callbacks. Without the
+// annotations `noImplicitAny` fails the typecheck.
 function fakeDb(overrides: Partial<Db> = {}): Db {
   return {
     getMeetingByCall: async () => null,
     takeSlot: async () => true,
-    insertMeeting: async (_c, _l, slot) => ({ id: 'm1', slotId: slot.id, startsAt: slot.startsAt }),
+    insertMeeting: async (_c: string, _l: string, slot: Slot) =>
+      ({ id: 'm1', slotId: slot.id, startsAt: slot.startsAt }),
     upsertQualification: async () => {},
     ...overrides,
   } as unknown as Db
@@ -2002,12 +2007,16 @@ function fakeRealtime() {
   return { client, calls, emit: (e: RealtimeEvent) => handler(e) }
 }
 
+// Parameters are annotated because the `as unknown as Db` cast happens after the
+// literal is built, so nothing contextually types these callbacks. Without the
+// annotations `noImplicitAny` fails the typecheck.
 function fakeDb(): Db {
   return {
     insertTranscriptTurn: async () => {},
     getMeetingByCall: async () => null,
     takeSlot: async () => true,
-    insertMeeting: async (_c, _l, s) => ({ id: 'm1', slotId: s.id, startsAt: s.startsAt }),
+    insertMeeting: async (_c: string, _l: string, s: Slot) =>
+      ({ id: 'm1', slotId: s.id, startsAt: s.startsAt }),
     upsertQualification: async () => {},
   } as unknown as Db
 }
@@ -2129,7 +2138,11 @@ it('stores transcript turns for both sides', async () => {
   const session = new CallSession({
     transport: t.transport, realtime: r.client, callId: 'c', leadId: 'l', slots: SLOTS,
     voicemailFrames: [],
-    db: { insertTranscriptTurn: async (_c, role, text) => { stored.push([role, text]) } } as unknown as Db,
+    db: {
+      insertTranscriptTurn: async (_c: string, role: 'agent' | 'prospect', text: string) => {
+        stored.push([role, text])
+      },
+    } as unknown as Db,
   })
   t.inject(startMessage())
   r.emit({ kind: 'transcript', role: 'agent', text: 'Hi, this is Sara' })
