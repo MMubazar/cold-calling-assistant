@@ -3684,8 +3684,8 @@ if (process.argv[1]?.endsWith('server.ts')) {
 - [ ] **Step 7: Run the full suite to verify everything passes**
 
 Run: `cd backend && TEST_DATABASE_URL=postgres://sb@127.0.0.1:5470/coldcall_test npm test`
-Expected: all suites green — 13 test files, 151 tests (5 env, 9 allowlist, 7 twilio-frames,
-12 audio, 11 db, 9 playbook, 12 tool-handlers, 18 realtime, 19 session, 11 ulaw, 17 voicemail,
+Expected: all suites green — 13 test files, 148 tests (5 env, 9 allowlist, 7 twilio-frames,
+12 audio, 11 db, 9 playbook, 12 tool-handlers, 18 realtime, 19 session, 10 ulaw, 16 voicemail,
 2 teardown, 18 server-routes).
 
 - [ ] **Step 8: Typecheck**
