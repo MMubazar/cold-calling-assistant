@@ -2,8 +2,8 @@
 
 This is the document the operator follows to make the first real phone call. It has not been
 executed against a live phone in this environment — there are no Twilio credentials, no OpenAI
-API key, and no phone available here. Steps 3 and 4 (the two acceptance calls) are the
-operator's to run.
+API key, and no phone available here. The two acceptance calls below ("Test call 1" and
+"Test call 2") are the operator's to run.
 
 ## One-time setup
 
@@ -35,6 +35,15 @@ Postgres."
 
 ### 1. Create the database and apply the schema
 
+If the `coldcall` and `coldcall_test` databases don't exist yet on the cluster:
+
+```bash
+createdb -h 127.0.0.1 -p 5470 -U sb coldcall
+createdb -h 127.0.0.1 -p 5470 -U sb coldcall_test
+```
+
+Then apply the schema:
+
 ```bash
 cd backend
 npm run db:reset
@@ -42,6 +51,13 @@ npm run db:reset
 
 That runs `psql -h 127.0.0.1 -p 5470 -U sb -d coldcall -f db/schema.sql` (see `package.json`) —
 it drops and recreates every table in `coldcall`, so don't run it against data you want to keep.
+It only touches the `coldcall` database. The test suite expects `coldcall_test` to already have
+the same schema (it truncates tables between tests but never creates them); apply it by hand the
+same way if `coldcall_test` is freshly created:
+
+```bash
+psql -h 127.0.0.1 -p 5470 -U sb -d coldcall_test -f db/schema.sql
+```
 
 Then seed some open meeting slots (the agent can't book a meeting without any):
 
